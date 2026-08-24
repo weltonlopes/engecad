@@ -9,7 +9,7 @@ QTransform com valores de magnitude UTM chega ao motor de rasterizacao.
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QFont, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from ..core.entities import POINT_LIKE, entity_insert_point, entity_polylines
@@ -114,6 +114,13 @@ class CadCanvas(QWidget):
             self._panning = False
             self._pan_anchor = None
             self.setCursor(Qt.BlankCursor)
+            return
+        if ev.button() == Qt.LeftButton:
+            tool = self.ctx.tool
+            p = self.effective_point()
+            if tool is not None and p is not None:
+                tool.on_release(p, ev)
+                self.update()
 
     def wheelEvent(self, ev):
         delta = ev.angleDelta().y()
@@ -136,6 +143,18 @@ class CadCanvas(QWidget):
         if ev.key() == Qt.Key_Escape:
             self.ctx.cancel_tool()
             self.update()
+            return
+
+        # Como no AutoCAD: digitar com o foco no desenho cai na linha de
+        # comando. Evita que o usuario tenha de clicar la embaixo antes de
+        # cada comando, e dispensa atalhos de uma letra so no menu (que
+        # roubariam a tecla de quem esta digitando).
+        text = ev.text()
+        blocked = ev.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
+        cl = getattr(self.ctx, "command_line", None)
+        if cl is not None and text and text.isprintable() and not blocked:
+            cl.entry.setFocus()
+            cl.entry.setText(cl.entry.text() + text)
             return
         super().keyPressEvent(ev)
 
@@ -160,6 +179,8 @@ class CadCanvas(QWidget):
         if self.show_grid:
             self._paint_grid(painter)
         self._paint_entities(painter)
+        self._paint_hover(painter)
+        self._paint_selection(painter)
 
         tool = self.ctx.tool
         if tool is not None:
@@ -167,6 +188,7 @@ class CadCanvas(QWidget):
             tool.paint(painter, self.vp)
             painter.restore()
 
+        self._paint_grips(painter)
         self._paint_snap(painter)
         if self.show_crosshair:
             self._paint_cursor(painter)
@@ -267,6 +289,75 @@ class CadCanvas(QWidget):
             return
         # INSERT e outros: marcador simples
         painter.drawRect(QRectF(sx - 3, sy - 3, 6, 6))
+
+    def _entity_outline(self, painter, entity, tol):
+        """Traca o contorno da entidade com a caneta ja escolhida."""
+        vp = self.vp
+        if entity.dxftype() in POINT_LIKE:
+            p = entity_insert_point(entity)
+            if p is not None:
+                x, y = vp.world_to_screen(p)
+                painter.drawRect(QRectF(x - 5, y - 5, 10, 10))
+            return
+        for poly in entity_polylines(entity, tol):
+            pts = [QPointF(*vp.world_to_screen(p)) for p in poly]
+            if len(pts) >= 2:
+                painter.drawPolyline(QPolygonF(pts))
+
+    def _paint_hover(self, painter):
+        """Realce leve da entidade sob o cursor, antes de clicar."""
+        tool = self.ctx.tool
+        if tool is None or not tool.is_idle:
+            return
+        e = getattr(tool, "hover", None)
+        sel = self.ctx.selection
+        if e is None or not e.is_alive or (sel is not None and e in sel):
+            return
+        color = QColor(self.theme.selection)
+        color.setAlpha(150)
+        pen = QPen(color, 3.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        self._entity_outline(painter, e, self.vp.flatten_tolerance(0.5))
+
+    def _paint_selection(self, painter):
+        sel = self.ctx.selection
+        if sel is None or not len(sel):
+            return
+        pen = QPen(self.theme.q("selection"), 1.8)
+        pen.setStyle(Qt.DashLine)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        tol = self.vp.flatten_tolerance(0.4)
+        for e in sel:
+            self._entity_outline(painter, e, tol)
+
+    def _paint_grips(self, painter):
+        tool = self.ctx.tool
+        if tool is None or not tool.is_idle:
+            return
+        grips = tool.visible_grips()
+        if not grips:
+            return
+        hovered = getattr(tool, "hover_grip", None)
+        vp = self.vp
+        base = QColor(self.theme.selection)
+        hot = QColor("#ff8c1a")
+        pen = QPen(base.darker(150), 1)
+        pen.setCosmetic(True)
+        for g in grips:
+            x, y = vp.world_to_screen(g.point)
+            is_hot = (
+                hovered is not None
+                and hovered.entity is g.entity
+                and hovered.kind == g.kind
+                and hovered.index == g.index
+            )
+            s = 6 if is_hot else 4.5
+            painter.setPen(pen)
+            painter.setBrush(QBrush(hot if is_hot else base))
+            painter.drawRect(QRectF(x - s, y - s, 2 * s, 2 * s))
+        painter.setBrush(Qt.NoBrush)
 
     def _paint_snap(self, painter):
         if self._snap is None:

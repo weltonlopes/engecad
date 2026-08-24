@@ -8,6 +8,7 @@ espacial) esta empilhado aqui por cima.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import ezdxf
@@ -16,6 +17,7 @@ from ezdxf.document import Drawing
 from .crs import ProjectCRS
 from .entities import entity_bbox
 from .geometry import BBox, Vec2
+from .snapshot import restore, snapshot
 from .spatial_index import GridIndex
 from .undo import Command, UndoStack
 
@@ -72,6 +74,33 @@ class AddEntities(_EntityCommand):
 class DeleteEntities(_EntityCommand):
     redo = _EntityCommand._unlink
     undo = _EntityCommand._link
+
+
+class ModifyGeometry(Command):
+    """Edicao de geometria desfeita por instantaneo.
+
+    Cobre mover, girar, espelhar, esticar grip, aparar e estender -- tudo que
+    altera a forma sem criar nem apagar entidade. Ver core/snapshot.py para a
+    razao de nao usarmos matriz inversa.
+    """
+
+    def __init__(self, doc: Document, records: list[tuple], name: str):
+        self.doc = doc
+        self.records = records  # (entidade, antes, depois)
+        self.name = name
+
+    def _apply(self, after: bool) -> None:
+        for entity, before, depois in self.records:
+            if entity.is_alive:
+                restore(entity, depois if after else before)
+                self.doc._index_update(entity)
+        self.doc._touch()
+
+    def redo(self) -> None:
+        self._apply(True)
+
+    def undo(self) -> None:
+        self._apply(False)
 
 
 class Document:
@@ -207,6 +236,15 @@ class Document:
         self._by_handle[h] = entity
         self.index.insert(h, entity_bbox(entity))
 
+    def _index_update(self, entity) -> None:
+        """Reposiciona a entidade no indice apos a geometria mudar."""
+        h = entity.dxf.get("handle")
+        if h is None:
+            return
+        self.index.remove(h)
+        self.index.insert(h, entity_bbox(entity))
+        self._by_handle[h] = entity
+
     def _index_remove(self, entity) -> None:
         h = entity.dxf.get("handle")
         if h is None:
@@ -277,6 +315,91 @@ class Document:
         )
         e.set_placement((v.x, v.y))
         return self._register_new(e, "texto")
+
+    def add_arc(
+        self, center, radius: float, start_angle: float, end_angle: float,
+        layer: str | None = None, **kw
+    ):
+        c = Vec2.of(center)
+        e = self.msp.add_arc(
+            (c.x, c.y),
+            float(radius),
+            float(start_angle),
+            float(end_angle),
+            dxfattribs=self._attribs(layer, kw),
+        )
+        return self._register_new(e, "arco")
+
+    # ---------------- edicao ----------------
+
+    @contextmanager
+    def editing(self, entities: Iterable, name: str = "editar"):
+        """Envolve uma edicao de geometria num item de desfazer exato.
+
+        Uso:
+            with doc.editing(sel, "mover"):
+                for e in sel:
+                    e.transform(matrix)
+
+        Entidades de tipo nao suportado pelo snapshot sao ignoradas em vez de
+        entrarem no undo pela metade.
+        """
+        items = [e for e in entities if e is not None and e.is_alive]
+        before = [(e, snapshot(e)) for e in items]
+        yield items
+        records = []
+        for entity, antes in before:
+            if antes is None or not entity.is_alive:
+                continue
+            records.append((entity, antes, snapshot(entity)))
+            self._index_update(entity)
+        if records:
+            self.undo.push(ModifyGeometry(self, records, name), execute=False)
+            self._touch()
+
+    def transform(self, entities: Iterable, matrix, name: str = "transformar") -> list:
+        """Aplica uma Matrix44 as entidades, de forma desfazivel."""
+        with self.editing(entities, name) as items:
+            for e in items:
+                if snapshot(e) is not None:
+                    e.transform(matrix)
+        return items
+
+    def copy_entities(self, entities: Iterable, matrix=None, name: str = "copiar") -> list:
+        """Duplica entidades (opcionalmente transformadas) como novas do desenho."""
+        made = []
+        for e in entities:
+            if e is None or not e.is_alive:
+                continue
+            clone = e.copy()
+            if matrix is not None:
+                clone.transform(matrix)
+            self.msp.add_entity(clone)
+            self._index_add(clone)
+            made.append(clone)
+        if made:
+            self.undo.push(AddEntities(self, made, name), execute=False)
+            self._touch()
+        return made
+
+    def replace(self, old: Iterable, new_factory, name: str = "substituir") -> list:
+        """Troca entidades por outras (aparar, estender, explodir).
+
+        new_factory(entity) devolve uma lista de entidades novas -- vazia para
+        simplesmente apagar. Tudo entra como um unico item de desfazer.
+        """
+        old_items = [e for e in old if e is not None and e.is_alive]
+        if not old_items:
+            return []
+        self.undo.begin_macro(name)
+        created = []
+        try:
+            for entity in old_items:
+                created.extend(new_factory(entity) or [])
+            self.delete(old_items)
+        finally:
+            self.undo.end_macro()
+        return created
 
     def delete(self, entities: Iterable) -> None:
         items = [e for e in entities if e is not None and e.is_alive]

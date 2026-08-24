@@ -9,6 +9,17 @@ from __future__ import annotations
 from .core.coordinput import parse_coordinate
 from .tools.draw import LineTool, PolylineTool
 from .tools.measure import AreaTool, DistanceTool
+from .tools.modify import (
+    CopyTool,
+    EraseTool,
+    MirrorTool,
+    MoveTool,
+    OffsetTool,
+    RotateTool,
+    ScaleTool,
+)
+from .tools.shapes import ArcTool, CircleTool, RectangleTool, TextTool
+from .tools.trim import ExtendTool, TrimTool
 
 
 def register_builtin_commands(reg) -> None:
@@ -18,6 +29,67 @@ def register_builtin_commands(reg) -> None:
     )
     reg.register(
         "PLINE", lambda ctx, *a: PolylineTool(ctx), ("PL", "POL"), "Desenha polilinha", "desenho"
+    )
+    reg.register(
+        "RECT", lambda ctx, *a: RectangleTool(ctx), ("REC", "RETANGULO"),
+        "Retangulo por dois cantos", "desenho",
+    )
+    reg.register(
+        "CIRCLE", lambda ctx, *a: CircleTool(ctx), ("C", "CIRCULO"),
+        "Circulo por centro e raio", "desenho",
+    )
+    reg.register(
+        "ARC", lambda ctx, *a: ArcTool(ctx), ("A", "ARCO"),
+        "Arco por tres pontos", "desenho",
+    )
+    reg.register(
+        "TEXT", lambda ctx, *a: TextTool(ctx), ("T", "TEXTO"),
+        "Insere um texto", "desenho",
+    )
+
+    # ---- modificar ----
+    reg.register(
+        "MOVE", lambda ctx, *a: MoveTool(ctx), ("M", "MOVER"), "Move a selecao", "modificar"
+    )
+    reg.register(
+        "COPY", lambda ctx, *a: CopyTool(ctx), ("CO", "COPIAR"), "Copia a selecao", "modificar"
+    )
+    reg.register(
+        "ROTATE", lambda ctx, *a: RotateTool(ctx), ("RO", "GIRAR"),
+        "Gira a selecao em torno de um ponto", "modificar",
+    )
+    reg.register(
+        "MIRROR", lambda ctx, *a: MirrorTool(ctx), ("MI", "ESPELHAR"),
+        "Espelha a selecao em torno de um eixo", "modificar",
+    )
+    reg.register(
+        "SCALE", lambda ctx, *a: ScaleTool(ctx), ("SC", "ESCALAR"),
+        "Escala a selecao a partir de um ponto base", "modificar",
+    )
+    reg.register(
+        "OFFSET", lambda ctx, *a: OffsetTool(ctx), ("O", "PARALELA"),
+        "Cria uma paralela a distancia dada", "modificar",
+    )
+    reg.register(
+        "TRIM", lambda ctx, *a: TrimTool(ctx), ("TR", "APARAR"),
+        "Apara no cruzamento com outras entidades", "modificar",
+    )
+    reg.register(
+        "EXTEND", lambda ctx, *a: ExtendTool(ctx), ("EX", "ESTENDER"),
+        "Estica ate encontrar outra entidade", "modificar",
+    )
+    reg.register(
+        "ERASE", lambda ctx, *a: EraseTool(ctx), ("E", "APAGAR"),
+        "Apaga a selecao", "modificar",
+    )
+
+    # ---- selecao ----
+    reg.register(
+        "SELTUDO", _select_all, ("SELALL",), "Seleciona tudo que estiver visivel",
+        "selecao", False,
+    )
+    reg.register(
+        "SELNADA", _select_none, ("DESSEL",), "Limpa a selecao", "selecao", False
     )
 
     # ---- consulta ----
@@ -29,7 +101,9 @@ def register_builtin_commands(reg) -> None:
     # ---- vista (acao imediata: devolvem None) ----
     reg.register("ZE", _zoom_extents, ("ZOOMEXT",), "Enquadra todo o desenho", "vista", False)
     reg.register("ZOOM", _zoom, ("Z",), "ZOOM <fator> ou ZOOM E", "vista", False)
-    reg.register("ESCALA", _set_scale, ("SC",), "ESCALA 500 ajusta para 1:500", "vista", False)
+    reg.register(
+        "ESCALA", _set_scale, ("PLOTESC",), "ESCALA 500 ajusta a vista para 1:500", "vista", False
+    )
     reg.register("PAN", _pan_to, ("P",), "PAN <x,y> centraliza na coordenada", "vista", False)
     reg.register("GRADE", _toggle_grid, ("GRID",), "Liga/desliga a grade", "vista", False)
 
@@ -99,6 +173,23 @@ def _pan_to(ctx, *args):
     ctx.viewport.center = p
     ctx.view_changed()
     ctx.message(f"Centralizado em {p.x:.3f}, {p.y:.3f}")
+
+
+def _select_all(ctx, *args):
+    visiveis = [
+        e
+        for e in ctx.doc.entities()
+        if e.is_alive and ctx.doc.layer_is_visible(e.dxf.get("layer", "0"))
+    ]
+    ctx.selection.set(visiveis)
+    ctx.refresh()
+    ctx.message(ctx.selection.summary())
+
+
+def _select_none(ctx, *args):
+    ctx.selection.clear()
+    ctx.refresh()
+    ctx.message("Selecao limpa")
 
 
 def _toggle_grid(ctx, *args):

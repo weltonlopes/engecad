@@ -74,7 +74,7 @@ class CommandLine(QWidget):
         self.prompt.setText(text or "Comando:")
 
     def _on_tool_changed(self, tool) -> None:
-        if tool is None:
+        if tool is None or tool.is_idle:
             self.set_prompt("")
         self.entry.setFocus()
 
@@ -114,7 +114,7 @@ class CommandLine(QWidget):
         self.entry.clear()
 
         tool = self.ctx.tool
-        if tool is not None:
+        if tool is not None and not tool.is_idle:
             if not text:
                 # Enter vazio com ferramenta ativa = concluir
                 tool.on_key(Qt.Key_Return)

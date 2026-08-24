@@ -13,6 +13,10 @@ from ..core.geometry import Vec2
 
 class Tool:
     name: str = "ferramenta"
+    #: True apenas na SelectTool, que fica ativa quando nenhum comando roda.
+    #: A linha de comando usa isto para decidir se o texto digitado e uma
+    #: coordenada (ferramenta ativa) ou um comando (ocioso).
+    is_idle: bool = False
     #: mensagem mostrada na linha de comando quando a ferramenta esta ativa
     prompt: str = ""
     #: se o comando entra no historico de "repetir com Enter" da linha de comando
@@ -46,6 +50,10 @@ class Tool:
         pass
 
     def on_click(self, world: Vec2, event=None) -> None:
+        pass
+
+    def on_release(self, world: Vec2, event=None) -> None:
+        """Soltar o botao esquerdo. Usado por selecao em janela."""
         pass
 
     def on_right_click(self, world: Vec2, event=None) -> None:

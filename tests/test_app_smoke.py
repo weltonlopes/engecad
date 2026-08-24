@@ -55,18 +55,18 @@ def test_window_boots_with_empty_metric_document(win):
 
 def test_command_line_activates_tool(win):
     _type(win, "LINE")
-    assert win.ctx.tool is not None
+    assert not win.ctx.idle
     assert win.ctx.tool.name == "LINE"
 
 
 def test_unknown_command_is_rejected_gracefully(win):
     _type(win, "COMANDOINEXISTENTE")
-    assert win.ctx.tool is None
+    assert win.ctx.idle, "comando invalido nao pode deixar ferramenta ativa"
 
 
 def test_command_abbreviation_resolves(win):
     _type(win, "L")  # alias de LINE
-    assert win.ctx.tool is not None and win.ctx.tool.name == "LINE"
+    assert not win.ctx.idle and win.ctx.tool.name == "LINE"
 
 
 def test_draw_line_entirely_by_typed_coordinates(win):
@@ -112,7 +112,7 @@ def test_escape_cancels_tool_without_drawing(win):
     _type(win, "LINE")
     _type(win, f"{E},{N}")
     win.ctx.cancel_tool()
-    assert win.ctx.tool is None
+    assert win.ctx.idle
     assert len(win.ctx.doc) == 0
 
 
@@ -220,7 +220,7 @@ def test_console_error_leaves_no_half_drawing(win):
 
 def test_console_api_command_uses_same_registry(win):
     win.console.execute("command('LINE')")
-    assert win.ctx.tool is not None and win.ctx.tool.name == "LINE"
+    assert not win.ctx.idle and win.ctx.tool.name == "LINE"
 
 
 def test_console_geodesy_roundtrip(win):

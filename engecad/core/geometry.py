@@ -177,6 +177,85 @@ def line_intersection(a1: Vec2, a2: Vec2, b1: Vec2, b2: Vec2, as_segments: bool 
     return a1 + d1 * t
 
 
+def line_circle_intersection(a: Vec2, b: Vec2, center: Vec2, radius: float,
+                             as_segment: bool = True) -> list[Vec2]:
+    """Intersecoes exatas de uma reta/segmento com um circulo.
+
+    Usado no aparar: achatar o circulo em segmentos deixaria a linha aparada
+    alguns milimetros fora do circulo, o que num CAD cadastral aparece.
+    """
+    d = b - a
+    f = a - center
+    aa = d.length_sq
+    if aa < EPS:
+        return []
+    bb = 2 * f.dot(d)
+    cc = f.length_sq - radius * radius
+    disc = bb * bb - 4 * aa * cc
+    if disc < 0:
+        return []
+    disc = math.sqrt(disc)
+    out = []
+    for t in ((-bb - disc) / (2 * aa), (-bb + disc) / (2 * aa)):
+        if as_segment and not (-EPS <= t <= 1 + EPS):
+            continue
+        out.append(a + d * t)
+    # tangente: as duas raizes coincidem
+    if len(out) == 2 and out[0].distance_to(out[1]) < EPS:
+        out.pop()
+    return out
+
+
+def circle_from_3points(a: Vec2, b: Vec2, c: Vec2):
+    """Circulo que passa por tres pontos: (centro, raio). None se colineares."""
+    d = 2 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y))
+    if abs(d) < EPS:
+        return None
+    a2, b2, c2 = a.length_sq, b.length_sq, c.length_sq
+    ux = (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d
+    uy = (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d
+    center = Vec2(ux, uy)
+    return center, center.distance_to(a)
+
+
+def circle_circle_intersection(c1: Vec2, r1: float, c2: Vec2, r2: float) -> list[Vec2]:
+    """Intersecoes exatas de dois circulos."""
+    d = c1.distance_to(c2)
+    if d < EPS or d > r1 + r2 + EPS or d < abs(r1 - r2) - EPS:
+        return []
+    a = (r1 * r1 - r2 * r2 + d * d) / (2 * d)
+    h_sq = r1 * r1 - a * a
+    if h_sq < 0:
+        h_sq = 0.0
+    h = math.sqrt(h_sq)
+    base = c1 + (c2 - c1) * (a / d)
+    if h < EPS:
+        return [base]
+    off = Vec2(-(c2.y - c1.y) * h / d, (c2.x - c1.x) * h / d)
+    return [base + off, base - off]
+
+
+def angle_in_range(angle: float, start: float, end: float) -> bool:
+    """O angulo (graus) esta no arco que vai de start a end no sentido anti-horario?"""
+    a = (angle - start) % 360.0
+    span = (end - start) % 360.0
+    if span < EPS:
+        span = 360.0
+    return a <= span + 1e-9
+
+
+def normal_left(d: Vec2) -> Vec2:
+    """Normal unitaria a esquerda da direcao d."""
+    n = d.normalized()
+    return Vec2(-n.y, n.x)
+
+
+def point_side(p: Vec2, a: Vec2, b: Vec2) -> float:
+    """Sinal do lado de p em relacao a reta ab: +1 esquerda, -1 direita."""
+    c = (b - a).cross(p - a)
+    return 1.0 if c > 0 else (-1.0 if c < 0 else 0.0)
+
+
 def polyline_length(pts, closed: bool = False) -> float:
     if len(pts) < 2:
         return 0.0

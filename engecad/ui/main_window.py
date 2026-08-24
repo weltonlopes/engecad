@@ -67,6 +67,7 @@ class MainWindow(QMainWindow):
 
         self.canvas = CadCanvas(self.ctx, self)
         self.cmdline = CommandLine(self.ctx, self)
+        self.ctx.command_line = self.cmdline
 
         central = QWidget(self)
         lay = QVBoxLayout(central)
@@ -113,8 +114,11 @@ class MainWindow(QMainWindow):
         self.lbl_scale.setMinimumWidth(100)
         self.lbl_layer = QLabel("", self)
         self.lbl_layer.setMinimumWidth(140)
+        self.lbl_sel = QLabel("", self)
+        self.lbl_sel.setMinimumWidth(120)
         self.lbl_crs = QLabel("", self)
-        for w in (self.lbl_coord, self.lbl_snap, self.lbl_scale, self.lbl_layer, self.lbl_crs):
+        for w in (self.lbl_coord, self.lbl_snap, self.lbl_sel,
+                  self.lbl_scale, self.lbl_layer, self.lbl_crs):
             sb.addPermanentWidget(w)
 
     def _act(self, text, slot, shortcut=None, tip=""):
@@ -143,9 +147,33 @@ class MainWindow(QMainWindow):
         m_edit.addAction(self._act("&Desfazer", lambda: self.run("U"), "Ctrl+Z"))
         m_edit.addAction(self._act("&Refazer", lambda: self.run("REDO"), "Ctrl+Y"))
 
+        # Sem atalhos de uma letra: no CAD as abreviacoes (L, PL, C, A...) sao
+        # digitadas na linha de comando, e um QAction de tecla unica competiria
+        # com a digitacao.
         m_draw = self.menuBar().addMenu("&Desenhar")
-        m_draw.addAction(self._act("&Linha", lambda: self.run("LINE"), "L"))
-        m_draw.addAction(self._act("&Polilinha", lambda: self.run("PLINE"), "P"))
+        m_draw.addAction(self._act("&Linha", lambda: self.run("LINE"), tip="alias: L"))
+        m_draw.addAction(self._act("&Polilinha", lambda: self.run("PLINE"), tip="alias: PL"))
+        m_draw.addAction(self._act("&Retangulo", lambda: self.run("RECT"), tip="alias: REC"))
+        m_draw.addAction(self._act("&Circulo", lambda: self.run("CIRCLE"), tip="alias: C"))
+        m_draw.addAction(self._act("&Arco (3 pontos)", lambda: self.run("ARC"), tip="alias: A"))
+        m_draw.addAction(self._act("&Texto", lambda: self.run("TEXT"), tip="alias: T"))
+
+        m_mod = self.menuBar().addMenu("&Modificar")
+        m_mod.addAction(self._act("&Mover", lambda: self.run("MOVE"), tip="alias: M"))
+        m_mod.addAction(self._act("&Copiar", lambda: self.run("COPY"), tip="alias: CO"))
+        m_mod.addAction(self._act("&Girar", lambda: self.run("ROTATE"), tip="alias: RO"))
+        m_mod.addAction(self._act("&Espelhar", lambda: self.run("MIRROR"), tip="alias: MI"))
+        m_mod.addAction(self._act("Escala&r", lambda: self.run("SCALE"), tip="alias: SC"))
+        m_mod.addAction(self._act("&Paralela", lambda: self.run("OFFSET"), tip="alias: O"))
+        m_mod.addSeparator()
+        m_mod.addAction(self._act("&Aparar", lambda: self.run("TRIM"), tip="alias: TR"))
+        m_mod.addAction(self._act("E&stender", lambda: self.run("EXTEND"), tip="alias: EX"))
+        m_mod.addAction(self._act("Apa&gar", lambda: self.run("ERASE"), "Del", "alias: E"))
+        m_mod.addSeparator()
+        m_mod.addAction(
+            self._act("Selecionar &tudo", lambda: self.run("SELTUDO"), "Ctrl+A")
+        )
+        m_mod.addAction(self._act("&Limpar selecao", lambda: self.run("SELNADA")))
 
         m_query = self.menuBar().addMenu("&Consultar")
         m_query.addAction(self._act("&Distancia e azimute", lambda: self.run("DIST")))
@@ -186,6 +214,7 @@ class MainWindow(QMainWindow):
         self.ctx.viewChanged.connect(self._on_view)
         self._on_view()
         self._on_document_replaced()
+        self._on_selection()
 
     # ---------------- atalho de comando ----------------
 
@@ -219,7 +248,14 @@ class MainWindow(QMainWindow):
             if not self.dock_console.isVisible():
                 self.dock_console.show()
 
+    def _on_selection(self) -> None:
+        n = len(self.ctx.selection) if self.ctx.selection else 0
+        self.lbl_sel.setText(f"{n} selecionado(s)" if n else "")
+
     def _on_document_replaced(self) -> None:
+        if self.ctx.selection is not None:
+            self.ctx.selection.changed.append(self._on_selection)
+        self._on_selection()
         self.console.rebind(self.ctx)
         self.layer_panel.reload()
         self._update_title()

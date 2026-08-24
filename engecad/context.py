@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, Signal
 from .core.document import Document
 from .core.geometry import BBox, Vec2
 from .core.registry import CommandRegistry
+from .core.selection import Selection
 from .render.viewport import Viewport
 from .snap.engine import SnapEngine
 
@@ -32,8 +33,10 @@ class AppContext(QObject):
         self.rasters: list = []
         self.tool = None
         self.canvas = None
+        self.command_line = None
         self._doc: Document | None = None
         self.snap: SnapEngine | None = None
+        self.selection: Selection | None = None
         self.set_document(doc or Document.new())
 
         from .commands import register_builtin_commands
@@ -54,9 +57,13 @@ class AppContext(QObject):
         self.cancel_tool()
         self._doc = doc
         self.snap = SnapEngine(doc)
+        self.selection = Selection(doc)
         doc.changed.append(self._on_doc_changed)
         doc.undo.changed.append(self._on_doc_changed)
+        # desfazer pode ressuscitar ou matar entidades: a selecao acompanha
+        doc.undo.changed.append(self.selection.prune)
         self.documentReplaced.emit()
+        self.set_tool(None)
         self.refresh()
 
     def _on_doc_changed(self) -> None:
@@ -66,33 +73,35 @@ class AppContext(QObject):
     # ---------------- ferramentas ----------------
 
     def set_tool(self, tool) -> None:
-        self.cancel_tool()
+        """Troca a ferramenta ativa. tool=None volta a ferramenta ociosa (selecao)."""
+        old = self.tool
+        self.tool = None
+        if old is not None:
+            old.deactivate()
+        if tool is None:
+            from .tools.select import SelectTool
+
+            tool = SelectTool(self)
         self.tool = tool
-        if tool is not None:
-            tool.activate()
+        tool.activate()
         self.toolChanged.emit(tool)
         self.refresh()
 
     def end_tool(self, tool=None) -> None:
         """Chamado pela propria ferramenta ao concluir."""
-        if self.tool is None or (tool is not None and tool is not self.tool):
+        if tool is not None and tool is not self.tool:
             return
-        finished = self.tool
-        self.tool = None
-        finished.deactivate()
         self.set_prompt("")
-        self.toolChanged.emit(None)
-        self.refresh()
+        self.set_tool(None)
 
     def cancel_tool(self) -> None:
-        if self.tool is None:
-            return
-        tool = self.tool
-        self.tool = None
-        tool.deactivate()
         self.set_prompt("")
-        self.toolChanged.emit(None)
-        self.refresh()
+        self.set_tool(None)
+
+    @property
+    def idle(self) -> bool:
+        """Nenhum comando rodando (so a ferramenta de selecao)."""
+        return self.tool is None or self.tool.is_idle
 
     # ---------------- comandos ----------------
 
@@ -102,7 +111,7 @@ class AppContext(QObject):
         if cd is None:
             self.message(f"Comando desconhecido: {name}")
             return False
-        self.cancel_tool()
+        self.set_tool(None)
         try:
             result = cd.handler(self, *args)
         except Exception as exc:  # nao derruba o app por causa de um comando

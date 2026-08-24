@@ -77,6 +77,86 @@ class ScriptAPI:
     def extents(self):
         return self.doc.extents()
 
+    # ---------------- selecao e edicao ----------------
+
+    def selected(self) -> list:
+        """Entidades atualmente selecionadas."""
+        return list(self._ctx.selection)
+
+    def select(self, entities) -> None:
+        if not isinstance(entities, (list, tuple, set)):
+            entities = [entities]
+        self._ctx.selection.set(entities)
+        self._ctx.refresh()
+
+    def select_all(self) -> list:
+        self._ctx.run_command("SELTUDO")
+        return self.selected()
+
+    def deselect(self) -> None:
+        self._ctx.selection.clear()
+        self._ctx.refresh()
+
+    def move(self, entities, delta_x, delta_y=None):
+        """Move entidades por um deslocamento (dx, dy)."""
+        from ezdxf.math import Matrix44
+
+        d = Vec2.of(delta_x if delta_y is None else (delta_x, delta_y))
+        items = self._as_list(entities)
+        self.doc.transform(items, Matrix44.translate(d.x, d.y, 0), "mover")
+        return items
+
+    def copy(self, entities, delta_x, delta_y=None) -> list:
+        from ezdxf.math import Matrix44
+
+        d = Vec2.of(delta_x if delta_y is None else (delta_x, delta_y))
+        return self.doc.copy_entities(
+            self._as_list(entities), Matrix44.translate(d.x, d.y, 0), "copiar"
+        )
+
+    def rotate(self, entities, base, degrees: float):
+        """Gira em torno de `base`, em graus no sentido anti-horario."""
+        import math
+
+        from ezdxf.math import Matrix44
+
+        b = Vec2.of(base)
+        m = Matrix44.chain(
+            Matrix44.translate(-b.x, -b.y, 0),
+            Matrix44.z_rotate(math.radians(degrees)),
+            Matrix44.translate(b.x, b.y, 0),
+        )
+        items = self._as_list(entities)
+        self.doc.transform(items, m, "girar")
+        return items
+
+    def scale(self, entities, base, factor: float):
+        from ezdxf.math import Matrix44
+
+        b = Vec2.of(base)
+        m = Matrix44.chain(
+            Matrix44.translate(-b.x, -b.y, 0),
+            Matrix44.scale(factor, factor, 1.0),
+            Matrix44.translate(b.x, b.y, 0),
+        )
+        items = self._as_list(entities)
+        self.doc.transform(items, m, "escalar")
+        return items
+
+    def offset(self, entity, distance: float, through=None):
+        """Cria a paralela da entidade. distance>0 = para a esquerda do trajeto."""
+        from ..core.offset import create_offset
+
+        return create_offset(
+            self.doc, entity, distance, Vec2.of(through) if through is not None else None
+        )
+
+    @staticmethod
+    def _as_list(entities) -> list:
+        if not isinstance(entities, (list, tuple, set)):
+            return [entities]
+        return list(entities)
+
     # ---------------- camadas ----------------
 
     def layers(self) -> list[str]:
