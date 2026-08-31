@@ -96,9 +96,12 @@ def test_click_selects_entity(win):
 
 
 def test_click_on_empty_space_clears_selection(win):
+    """Como no AutoCAD: o 1o clique em area vazia so abre a janela elastica;
+    o 2o clique e que confirma (aqui, uma janela vazia -> deselecao)."""
     _grade(win)
     _click(win, (E + 50, N))
     assert len(win.ctx.selection) == 1
+    _click(win, (E + 50, N + 70))
     _click(win, (E + 50, N + 70))
     assert len(win.ctx.selection) == 0
 
@@ -142,6 +145,30 @@ def test_crossing_drag_right_to_left_catches_everything(win):
     atravessa = d.add_line((E + 10, N + 5), (E + 300, N + 200))
     d.undo.clear()
     _drag(win, (E + 50, N + 30), (E, N))  # direita -> esquerda
+    assert set(win.ctx.selection.items) == {dentro, atravessa}
+
+
+def test_click_click_window_confirms_on_second_click(win):
+    """Como no AutoCAD: clicar (sem arrastar) em area vazia abre a janela
+    elastica, que so e confirmada no clique seguinte."""
+    d = win.ctx.doc
+    dentro = d.add_line((E + 10, N + 5), (E + 30, N + 15))
+    d.add_line((E + 10, N + 5), (E + 300, N + 200))  # sai da janela
+    d.undo.clear()
+    _click(win, (E, N))  # 1o clique: so ancora a janela
+    assert win.ctx.tool.pick.awaiting_confirm
+    _click(win, (E + 50, N + 30))  # 2o clique: confirma, esquerda -> direita
+    assert win.ctx.selection.items == [dentro]
+    assert not win.ctx.tool.pick.awaiting_confirm
+
+
+def test_click_click_crossing_catches_everything(win):
+    d = win.ctx.doc
+    dentro = d.add_line((E + 10, N + 5), (E + 30, N + 15))
+    atravessa = d.add_line((E + 10, N + 5), (E + 300, N + 200))
+    d.undo.clear()
+    _click(win, (E + 50, N + 60))  # ancora a janela, em area vazia
+    _click(win, (E, N))  # confirma, direita -> esquerda = captura
     assert set(win.ctx.selection.items) == {dentro, atravessa}
 
 

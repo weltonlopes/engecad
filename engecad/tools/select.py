@@ -35,6 +35,10 @@ class PickHelper:
         self.anchor_screen: QPointF | None = None
         self.cursor: Vec2 | None = None
         self.box_active = False
+        #: True depois de um clique (sem arrasto) em area vazia: a janela
+        #: elastica fica acompanhando o mouse e so termina no proximo clique,
+        #: como no AutoCAD.
+        self.awaiting_confirm = False
 
     @property
     def crossing(self) -> bool:
@@ -89,6 +93,7 @@ class PickHelper:
         self.anchor = None
         self.anchor_screen = None
         self.box_active = False
+        self.awaiting_confirm = False
 
     def paint(self, painter, vp) -> None:
         if not self.box_active or self.anchor is None or self.cursor is None:
@@ -149,6 +154,13 @@ class SelectTool(Tool):
         )
 
     def on_click(self, world: Vec2, event=None) -> None:
+        # Segundo clique de uma janela elastica pendente: confirma a selecao
+        # no ponto atual, exatamente como soltar o botao faria no arrasto.
+        if self.pick.awaiting_confirm:
+            found, mode = self.pick.finish(world, self.ctx.viewport)
+            self._apply_pick(found, mode)
+            return
+
         mods = event.modifiers() if event is not None else Qt.NoModifier
         self._additive = bool(mods & (Qt.ShiftModifier | Qt.ControlModifier))
 
@@ -167,10 +179,31 @@ class SelectTool(Tool):
     def on_release(self, world: Vec2, event=None) -> None:
         if self.pick.anchor is None:
             return
-        found, mode = self.pick.finish(world, self.ctx.viewport)
+        if self.pick.box_active:
+            # Arrasto classico: soltar o botao ja termina a janela.
+            found, mode = self.pick.finish(world, self.ctx.viewport)
+            self._apply_pick(found, mode)
+            return
+
+        # Botao solto sem arrastar. Se ha algo sob o cursor, selecao
+        # imediata de clique. Senao, como no AutoCAD, o primeiro clique so
+        # abre a janela elastica -- ela fica seguindo o mouse e o proximo
+        # clique (em on_click) e que confirma.
+        tol = self.ctx.viewport.px_to_world(PICK_TOL_PX)
+        hit = pick_at(self.ctx.doc, world, tol)
+        if hit is not None:
+            self.pick.reset()
+            self._apply_pick([hit], "clique")
+            return
+        self.pick.cursor = world
+        self.pick.box_active = True
+        self.pick.awaiting_confirm = True
+        self.ctx.refresh()
+
+    def _apply_pick(self, found: list, mode: str) -> None:
         sel = self.ctx.selection
         if not found:
-            if not self._additive and mode == "clique":
+            if not self._additive:
                 sel.clear()
         elif self._additive:
             sel.toggle(found)
@@ -182,8 +215,12 @@ class SelectTool(Tool):
 
     def on_right_click(self, world: Vec2, event=None) -> None:
         # botao direito com selecao ativa nao deve encerrar a ferramenta ociosa
+        self.pick.reset()
         self.ctx.selection.clear()
         self.ctx.refresh()
+
+    def deactivate(self) -> None:
+        self.pick.reset()
 
     def on_key(self, key, modifiers=None) -> bool:
         if key == Qt.Key_Escape:

@@ -9,6 +9,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -26,18 +27,21 @@ from ..io.raster_import import (
     execute_plan,
     plan_import,
 )
+from ..io.shapefile_import import ShapefileImportError, import_shapefile, shapefile_fields
 from ..render.canvas import CadCanvas
 from ..render.raster_layer import RasterLayer
 from ..scripting.console import PythonConsole
 from .command_line import CommandLine
 from .crs_dialog import CrsDialog
 from .layer_panel import LayerPanel
+from .properties_panel import PropertiesPanel
 
 RASTER_FILTER = (
     "Imagens georreferenciadas (*.ecw *.tif *.tiff *.jp2 *.img *.sid *.vrt *.png *.jpg);;"
     "ECW (*.ecw);;GeoTIFF/COG (*.tif *.tiff);;Todos (*)"
 )
 DXF_FILTER = "Desenho DXF (*.dxf);;Todos (*)"
+SHAPEFILE_FILTER = "Shapefile (*.shp);;Todos (*)"
 
 
 class _ConvertWorker(QThread):
@@ -96,6 +100,15 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self.dock_layers = dock
 
+        self.properties_panel = PropertiesPanel(self.ctx, self)
+        pdock = QDockWidget("Propriedades", self)
+        pdock.setObjectName("dock_propriedades")
+        pdock.setWidget(self.properties_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, pdock)
+        self.tabifyDockWidget(dock, pdock)
+        pdock.hide()
+        self.dock_properties = pdock
+
         self.console = PythonConsole(self.ctx, self)
         cdock = QDockWidget("Console Python", self)
         cdock.setObjectName("dock_console")
@@ -139,6 +152,9 @@ class MainWindow(QMainWindow):
         m_file.addSeparator()
         m_file.addAction(
             self._act("&Importar imagem de fundo...", self.on_import_raster, "Ctrl+I")
+        )
+        m_file.addAction(
+            self._act("Importar &shapefile...", self.on_import_shapefile, "Ctrl+Shift+I")
         )
         m_file.addSeparator()
         m_file.addAction(self._act("Sai&r", self.close, "Ctrl+Q"))
@@ -192,6 +208,10 @@ class MainWindow(QMainWindow):
         m_proj.addAction(self._act("&Imagens carregadas...", self.on_raster_info))
 
         m_tools = self.menuBar().addMenu("&Ferramentas")
+        a_props = self.dock_properties.toggleViewAction()
+        a_props.setText("&Propriedades")
+        a_props.setShortcut(QKeySequence("Ctrl+1"))
+        m_tools.addAction(a_props)
         a_console = self.dock_console.toggleViewAction()
         a_console.setText("&Console Python")
         a_console.setShortcut(QKeySequence("F9"))
@@ -395,6 +415,52 @@ class MainWindow(QMainWindow):
 
     def on_diagnose(self) -> None:
         QMessageBox.information(self, "Diagnostico de raster", diagnose())
+
+    # ---------------- shapefile ----------------
+
+    def on_import_shapefile(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Importar shapefile", "", SHAPEFILE_FILTER)
+        if not path:
+            return
+
+        try:
+            fields = shapefile_fields(path)
+        except ShapefileImportError as exc:
+            QMessageBox.critical(self, "Erro ao ler shapefile", str(exc))
+            return
+
+        default_layer = Path(path).stem.upper()
+        layer, ok = QInputDialog.getText(
+            self, "Importar shapefile", "Camada de destino:", text=default_layer
+        )
+        if not ok:
+            return
+        layer = layer.strip() or default_layer
+
+        attribute_field = None
+        if fields:
+            options = ["(nenhum - tudo em uma camada)"] + fields
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Importar shapefile",
+                "Separar em camadas pelo campo:",
+                options,
+                0,
+                False,
+            )
+            if not ok:
+                return
+            if choice != options[0]:
+                attribute_field = choice
+
+        try:
+            result = import_shapefile(self.ctx, path, layer=layer, attribute_field=attribute_field)
+        except ShapefileImportError as exc:
+            QMessageBox.critical(self, "Erro ao importar shapefile", str(exc))
+            return
+
+        self.ctx.zoom_extents()
+        self.ctx.message(result.summary)
 
     # ---------------- projeto ----------------
 

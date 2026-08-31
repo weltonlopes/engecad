@@ -37,6 +37,8 @@ class AppContext(QObject):
         self._doc: Document | None = None
         self.snap: SnapEngine | None = None
         self.selection: Selection | None = None
+        #: Grip de vertice em foco no painel de propriedades (realce no canvas).
+        self.vertex_focus = None
         self.set_document(doc or Document.new())
 
         from .commands import register_builtin_commands
@@ -58,6 +60,7 @@ class AppContext(QObject):
         self._doc = doc
         self.snap = SnapEngine(doc)
         self.selection = Selection(doc)
+        self.vertex_focus = None
         doc.changed.append(self._on_doc_changed)
         doc.undo.changed.append(self._on_doc_changed)
         # desfazer pode ressuscitar ou matar entidades: a selecao acompanha

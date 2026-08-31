@@ -189,6 +189,7 @@ class CadCanvas(QWidget):
             painter.restore()
 
         self._paint_grips(painter)
+        self._paint_vertex_focus(painter)
         self._paint_snap(painter)
         if self.show_crosshair:
             self._paint_cursor(painter)
@@ -358,6 +359,23 @@ class CadCanvas(QWidget):
             painter.setBrush(QBrush(hot if is_hot else base))
             painter.drawRect(QRectF(x - s, y - s, 2 * s, 2 * s))
         painter.setBrush(Qt.NoBrush)
+
+    def _paint_vertex_focus(self, painter):
+        """Realce do vertice navegado no painel de propriedades (Ctrl+1)."""
+        focus = getattr(self.ctx, "vertex_focus", None)
+        if focus is None or not focus.entity.is_alive:
+            return
+        x, y = self.vp.world_to_screen(focus.point)
+        pen = QPen(QColor("#ffb347"), 2.2)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        r = 9
+        painter.drawEllipse(QPointF(x, y), r, r)
+        painter.drawLine(QPointF(x - r - 5, y), QPointF(x - r + 2, y))
+        painter.drawLine(QPointF(x + r - 2, y), QPointF(x + r + 5, y))
+        painter.drawLine(QPointF(x, y - r - 5), QPointF(x, y - r + 2))
+        painter.drawLine(QPointF(x, y + r - 2), QPointF(x, y + r + 5))
 
     def _paint_snap(self, painter):
         if self._snap is None:

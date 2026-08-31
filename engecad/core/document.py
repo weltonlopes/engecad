@@ -103,6 +103,33 @@ class ModifyGeometry(Command):
         self._apply(False)
 
 
+class SetAttribs(Command):
+    """Muda atributos DXF simples (camada, cor...) das entidades, desfazivel.
+
+    Usado pelo painel de propriedades: nao mexe em geometria (isso e
+    ModifyGeometry/snapshot), so em pares chave/valor do namespace dxf.
+    """
+
+    def __init__(self, doc: Document, records: list[tuple], name: str):
+        self.doc = doc
+        self.records = records  # (entidade, {attr: antes}, {attr: depois})
+        self.name = name
+
+    def _apply(self, after: bool) -> None:
+        for entity, before, depois in self.records:
+            if not entity.is_alive:
+                continue
+            for k, v in (depois if after else before).items():
+                setattr(entity.dxf, k, v)
+        self.doc._touch()
+
+    def redo(self) -> None:
+        self._apply(True)
+
+    def undo(self) -> None:
+        self._apply(False)
+
+
 class Document:
     def __init__(
         self,
@@ -400,6 +427,21 @@ class Document:
         finally:
             self.undo.end_macro()
         return created
+
+    # atributos opcionais do DXF: sem isso, dxf.get() devolve None para uma
+    # entidade que nunca teve o atributo setado, e regravar None quebra o ezdxf.
+    _ATTRIB_DEFAULTS = {"layer": "0", "color": 256}
+
+    def set_entity_attribs(self, entities: Iterable, name: str = "propriedades", **attrs) -> None:
+        """Altera atributos DXF simples (camada, cor...) das entidades, com desfazer."""
+        items = [e for e in entities if e is not None and e.is_alive]
+        if not items:
+            return
+        records = [
+            (e, {k: e.dxf.get(k, self._ATTRIB_DEFAULTS.get(k)) for k in attrs}, dict(attrs))
+            for e in items
+        ]
+        self.undo.push(SetAttribs(self, records, name))
 
     def delete(self, entities: Iterable) -> None:
         items = [e for e in entities if e is not None and e.is_alive]

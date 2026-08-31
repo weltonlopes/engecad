@@ -47,6 +47,7 @@ python -m engecad planta.dxf     # abre um desenho direto
 | **Camadas** | visibilidade, cor ACI, camada corrente |
 | **Medição** | `DIST` (distância + azimute em GMS), `AREA` (área + perímetro + hectares) |
 | **Arquivo** | abrir/salvar DXF R2018 + sidecar `.emap.json` |
+| **Importar** | shapefile (`.shp`, com reprojeção via `.prj` e separação em camadas por atributo) |
 | **Automação** | console Python embutido (F9) e execução de arquivos `.py` |
 
 ### Entrada de coordenada — o que dá precisão topográfica
@@ -178,6 +179,7 @@ engecad/
                grips, offset, aparar, índice espacial, registro     (SEM Qt)
   render/      viewport, canvas, camada raster, tema
   io/          DXF, sidecar .emap.json, importação de raster (cadeia ECW)
+               e de shapefile
   tools/       ferramentas interativas (máquinas de estado)
   snap/        motor de osnap
   ui/          janela, linha de comando, painel de camadas, diálogo de CRS
@@ -195,7 +197,7 @@ testáveis sem abrir janela.
 pytest -q
 ```
 
-202 testes. Os que mais importam:
+218 testes. Os que mais importam:
 
 - ida e volta `mundo → tela → mundo` com coordenada UTM real (exigido < 1 mm; medido: 0);
 - zoom ancorado 60× sem deriva do ponto sob o cursor;
@@ -204,7 +206,8 @@ pytest -q
 - round-trip DXF: criar → salvar → reabrir → geometria idêntica;
 - snap escolhendo o candidato certo por prioridade e por raio em pixels;
 - script no console desfazendo num passo, e script que falha não deixando resíduo;
-- **desenhar sobre a ortofoto e conferir que o DXF salvo tem a coordenada do mundo real.**
+- **desenhar sobre a ortofoto e conferir que o DXF salvo tem a coordenada do mundo real;**
+- importar shapefile em CRS diferente do projeto e conferir a reprojeção via `.prj`.
 
 Os testes de interface sobem a aplicação inteira em modo offscreen, simulam
 cliques e arrastos com `QMouseEvent` de verdade e chegam a verificar os pixels
