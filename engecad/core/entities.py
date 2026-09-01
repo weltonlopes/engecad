@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 from ezdxf import bbox as ezbbox
 from ezdxf.path import from_hatch_boundary_path, make_path
 
 from .dimensions import DIMENSION_TYPES, dimension_primitives
 from .geometry import BBox, Vec2
+from .proxygraphic import proxy_point_lists
 
 # Entidades que viram texto/marcador em vez de polilinha.
 POINT_LIKE = {"POINT", "TEXT", "MTEXT", "INSERT", "ATTDEF"}
@@ -101,13 +103,73 @@ def _block_definition_has_text(doc, name: str, seen: set[str]) -> bool:
     return False
 
 
+_MAX_SEGMENT_CACHE = 512
+_segment_cache: dict[tuple, tuple] = {}
+
+
+def entity_segments(entity, sagitta: float):
+    """Segmentos achatados da entidade, em arrays numpy. None se nao houver.
+
+    Snap e picking medem a distancia do cursor ate a geometria a cada movimento
+    do mouse. Um eixo de rodovia com 7951 vertices e bulge vira 177 mil pontos
+    quando achatado: refazer isso por movimento custava 19 ms so nessa entidade,
+    e percorrer os segmentos em Python custava outro tanto.
+
+    O achatamento fica guardado por OITAVA de tolerancia -- mexer o mouse nao
+    troca de oitava, entao o cache serve --, e a forma de array deixa a conta de
+    distancia sair vetorizada.
+    """
+    handle = entity.dxf.get("handle")
+    if handle is None:
+        return _segments_of(entity_point_lists(entity, sagitta))
+    octave = int(math.floor(math.log2(max(sagitta, 1e-9))))
+    key = (handle, octave)
+    hit = _segment_cache.get(key)
+    if hit is None:
+        hit = _segments_of(entity_point_lists(entity, 2.0**octave)) or ()
+        if len(_segment_cache) >= _MAX_SEGMENT_CACHE:
+            _segment_cache.clear()
+        _segment_cache[key] = hit
+    return hit or None
+
+
+def _segments_of(polylines):
+    ax, ay, bx, by = [], [], [], []
+    for poly in polylines:
+        for (x0, y0), (x1, y1) in zip(poly, poly[1:], strict=False):
+            ax.append(x0)
+            ay.append(y0)
+            bx.append(x1)
+            by.append(y1)
+    if not ax:
+        return None
+    ax = np.array(ax)
+    ay = np.array(ay)
+    return (ax, ay, np.array(bx) - ax, np.array(by) - ay)
+
+
+def closest_on_segments(segs, x: float, y: float):
+    """(distancias, xs, ys) do ponto ate cada segmento, de uma vez."""
+    ax, ay, dx, dy = segs
+    ex, ey = x - ax, y - ay
+    length = dx * dx + dy * dy
+    with np.errstate(invalid="ignore", divide="ignore"):
+        u = np.where(length > 0.0, (ex * dx + ey * dy) / length, 0.0)
+    np.clip(u, 0.0, 1.0, out=u)
+    px, py = ax + u * dx, ay + u * dy
+    return np.hypot(x - px, y - py), px, py
+
+
 def invalidate_primitives(handle: str | None = None) -> None:
     """Descarta o cache de primitivas de uma entidade, ou de todas."""
     if handle is None:
         _primitive_cache.clear()
         _block_text.clear()
+        _segment_cache.clear()
     else:
         _primitive_cache.pop(handle, None)
+        for key in [k for k in _segment_cache if k[0] == handle]:
+            del _segment_cache[key]
 
 
 def entity_polylines(
@@ -167,6 +229,14 @@ def entity_point_lists(
         return out
     if dxftype in POINT_LIKE:
         return []
+    if dxftype == "ACAD_PROXY_ENTITY":
+        # O caminho rapido desistiu: o ezdxf decodifica o blob por inteiro, e o
+        # resultado fica no cache de primitivas para nao se pagar de novo.
+        out = []
+        for primitive in entity_primitives(entity):
+            if primitive.dxftype() not in POINT_LIKE:
+                out.extend(entity_point_lists(primitive, sagitta, expand_blocks))
+        return out
     try:
         path = make_path(entity)
     except (TypeError, ValueError):
@@ -229,6 +299,9 @@ def _fast_points(entity, dxftype: str, sagitta: float):
 
         if dxftype == "HATCH":
             return _hatch_boundary_points(entity)
+
+        if dxftype == "ACAD_PROXY_ENTITY":
+            return proxy_point_lists(entity.proxy_graphic)
 
         if dxftype == "CIRCLE":
             if not _is_plan(entity):
@@ -343,6 +416,14 @@ def _fast_bbox(entity) -> BBox | None:
         if t == "ARC":
             return _arc_bbox(dxf.center, abs(float(dxf.radius)),
                              float(dxf.start_angle), float(dxf.end_angle))
+        if t == "ACAD_PROXY_ENTITY":
+            # O extrator generico do ezdxf custa 1.8 ms por proxy; num
+            # levantamento com 126 mil pontos sao quatro minutos so de indice.
+            polys = proxy_point_lists(entity.proxy_graphic)
+            if polys is None:
+                return None
+            return _bbox_of(polys)
+
         if t == "LWPOLYLINE":
             pts = entity.get_points("xy")
             if not pts:
@@ -356,6 +437,14 @@ def _fast_bbox(entity) -> BBox | None:
     except (AttributeError, TypeError, ValueError):
         return None
     return None
+
+
+def _bbox_of(polylines) -> BBox:
+    xs = [p[0] for poly in polylines for p in poly]
+    if not xs:
+        return BBox()
+    ys = [p[1] for poly in polylines for p in poly]
+    return BBox(min(xs), min(ys), max(xs), max(ys))
 
 
 def _arc_bbox(center, radius: float, start_deg: float, end_deg: float) -> BBox:
@@ -426,7 +515,12 @@ def entity_snap_points(entity) -> list[tuple[str, Vec2]]:
         return out
 
     # LWPOLYLINE, POLYLINE, SPLINE, ELLIPSE...: vertices + meios dos segmentos.
-    for poly in entity_polylines(entity, sagitta=0.001):
+    # A tolerancia acompanha o porte da entidade: 1 mm num eixo de rodovia de
+    # 5 km gera centenas de milhares de pontos de arco, e nenhum deles e vertice
+    # de verdade -- os vertices reais entram no achatamento em qualquer tolerancia.
+    box = entity_bbox(entity)
+    sagitta = max(0.001, max(box.width, box.height) * 1e-4)
+    for poly in entity_polylines(entity, sagitta=sagitta):
         for i, p in enumerate(poly):
             out.append(("end", p))
             if i + 1 < len(poly):

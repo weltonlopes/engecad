@@ -8,8 +8,15 @@ Como no AutoCAD, a janela tem dois sentidos:
 
 from __future__ import annotations
 
-from .entities import POINT_LIKE, entity_bbox, entity_insert_point, entity_polylines
-from .geometry import BBox, Vec2, distance_to_segment, line_intersection
+from .entities import (
+    POINT_LIKE,
+    closest_on_segments,
+    entity_bbox,
+    entity_insert_point,
+    entity_polylines,
+    entity_segments,
+)
+from .geometry import BBox, Vec2, line_intersection
 
 
 def entity_distance(entity, p: Vec2, sagitta: float = 0.01) -> float:
@@ -29,13 +36,11 @@ def entity_distance(entity, p: Vec2, sagitta: float = 0.01) -> float:
     if entity.dxftype() in POINT_LIKE:
         ins = entity_insert_point(entity)
         return p.distance_to(ins) if ins else float("inf")
-    best = float("inf")
-    for poly in entity_polylines(entity, sagitta):
-        for i in range(len(poly) - 1):
-            d = distance_to_segment(p, poly[i], poly[i + 1])
-            if d < best:
-                best = d
-    return best
+    segs = entity_segments(entity, sagitta)
+    if segs is None:
+        return float("inf")
+    distances, _, _ = closest_on_segments(segs, p.x, p.y)
+    return float(distances.min())
 
 
 def _visible(doc, entity) -> bool:

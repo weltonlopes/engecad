@@ -745,7 +745,7 @@ class DisplayList:
             keep &= np.isfinite(cx) & np.isfinite(cy)
             idx = np.flatnonzero(keep)
             if idx.size == 0:
-                self._buckets = (level, {}, ())
+                self._buckets = (level, {}, (), idx)
                 return {}, ()
             ratio = np.maximum(size[idx] / base, 1.0)
             rank = np.ceil(np.log2(ratio)).astype(np.int64)
@@ -762,18 +762,24 @@ class DisplayList:
         cuts = np.flatnonzero(key[1:] != key[:-1]) + 1
         starts = np.concatenate(([0], cuts))
         stops = np.concatenate((cuts, [key.size]))
-        groups: dict[tuple[int, int, int], list[int]] = {}
+        # O grupo guarda a FATIA do array, nao a lista: converter as 137 mil
+        # entidades para listas Python aqui custava 300 ms numa etapa que nao da
+        # para fatiar. Cada tile materializa a sua parte quando for construido.
+        groups: dict[tuple[int, int, int], tuple[int, int]] = {}
         for a, b in zip(starts.tolist(), stops.tolist(), strict=True):
-            groups[(int(rank[a]), int(tx[a]), int(ty[a]))] = members[a:b].tolist()
+            groups[(int(rank[a]), int(tx[a]), int(ty[a]))] = (a, b)
         ranks = tuple(sorted({int(r) for r in np.unique(rank)}))
 
-        self._buckets = (level, groups, ranks)
+        self._buckets = (level, groups, ranks, members)
         return groups, ranks
 
     def _members(self, level: int, key) -> list[int]:
         """Entidades que pertencem ao tile nesta oitava."""
         groups, _ = self._buckets_for(level)
-        return list(groups.get(key, ()))
+        span = groups.get(key)
+        if span is None:
+            return []
+        return self._buckets[3][span[0] : span[1]].tolist()
 
     def _bake_pending(self, cell: _Cell, level: int, deadline: float | None) -> None:
         """Assa a fila do tile ate o prazo. O que sobrar fica para a proxima."""
@@ -795,9 +801,11 @@ class DisplayList:
                     float(sizes[i]) / upw,
                 )
                 self._verts += cell.verts - before
-            # Conferir o relogio a cada entidade seria mais caro que assar uma:
-            # a granularidade de 64 mantem o desvio do orcamento abaixo de 1 ms.
-            if deadline is not None and done % 64 == 0 and time.perf_counter() >= deadline:
+            # A granularidade tem de acompanhar a entidade mais cara, nao a
+            # media: uma polilinha de 8 mil vertices com bulge leva 19 ms
+            # sozinha, e conferir o relogio a cada oito entidades custa menos de
+            # um microssegundo.
+            if deadline is not None and done % 8 == 0 and time.perf_counter() >= deadline:
                 break
         del pending[:done]
 
