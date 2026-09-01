@@ -24,8 +24,9 @@ from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from ..core.dimensions import DIMENSION_TYPES
-from ..core.entities import POINT_LIKE, entity_insert_point, entity_polylines, entity_primitives
-from ..core.geometry import Vec2
+from ..core.entities import POINT_LIKE, entity_insert_point, entity_point_lists, entity_primitives
+from ..core.geometry import Vec2, decimate
+from ..core.picking import probe_at
 from .displaylist import DisplayList
 from .framecache import FrameCache
 from .styles import DARK, aci_to_qcolor
@@ -44,6 +45,8 @@ REFINE_MS = 70  # espera antes do redesenho fino, em ms
 STEP_BUDGET_MS = 12.0
 FIRST_STEP_BUDGET_MS = 60.0  # a primeira fatia acomoda um desenho comum inteiro
 MAX_OUTLINES = 2_000  # contornos de selecao/realce desenhados por quadro
+MAX_OUTLINE_VERTS = 20_000
+POINTER_INTERVAL_MS = 8  # no maximo 125 resolucoes de snap/hover por segundo
 TEXT_TYPES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 
 
@@ -99,10 +102,13 @@ class CadCanvas(QWidget):
         # Junta a rajada de eventos de mouse numa resolucao so.
         self._pointer_dirty = False
         self._pointer_at: tuple[float, float] | None = None
+        self._pointer_probe = None
         self._pointer = QTimer(self)
         self._pointer.setSingleShot(True)
-        self._pointer.setInterval(0)
+        self._pointer.setInterval(POINTER_INTERVAL_MS)
         self._pointer.timeout.connect(self._resolve_pointer)
+        self._hover_key: tuple | None = None
+        self._hover_shapes: list = []
         ctx.documentReplaced.connect(self._on_document_replaced)
         # Qualquer mutacao do documento (geometria, cor ou visibilidade de
         # camada) invalida o quadro guardado; a display list so reconstroi os
@@ -119,6 +125,9 @@ class CadCanvas(QWidget):
 
     def _on_document_replaced(self) -> None:
         self._display = DisplayList(self.ctx.doc)
+        self._pointer_probe = None
+        self._hover_key = None
+        self._hover_shapes = []
         self.invalidate_scene()
 
     def invalidate_scene(self) -> None:
@@ -177,7 +186,11 @@ class CadCanvas(QWidget):
         self._pointer_at = (pos.x(), pos.y()) if pos is not None else None
         tool = self.ctx.tool
         exclude = tool.snap_exclude() if tool is not None else ()
-        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp, exclude=exclude)
+        radius = self.vp.px_to_world(self.ctx.snap.pixel_radius)
+        self._pointer_probe = probe_at(self.doc, self._cursor_world, radius, exclude)
+        self._snap = self.ctx.snap.snap(
+            self._cursor_world, self.vp, exclude=exclude, probe=self._pointer_probe
+        )
         self.snapChanged.emit(self._snap)
         self.coordinateMoved.emit(self.effective_point())
         if tool is not None:
@@ -205,7 +218,8 @@ class CadCanvas(QWidget):
         # esta; o trabalho de verdade acontece uma vez por volta do laco de
         # eventos, ja com a ultima posicao.
         self._pointer_dirty = True
-        self._pointer.start(0)
+        if not self._pointer.isActive():
+            self._pointer.start()
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.MiddleButton:
@@ -256,7 +270,8 @@ class CadCanvas(QWidget):
         # O raio de captura muda com o zoom: o snap tem de ser refeito, mas pode
         # esperar o fim da rajada da roda como qualquer movimento.
         self._pointer_dirty = True
-        self._pointer.start(0)
+        if not self._pointer.isActive():
+            self._pointer.start()
         self._emit_view_changed()
         self.update()
 
@@ -288,6 +303,7 @@ class CadCanvas(QWidget):
         self._pointer_dirty = False
         self._cursor_screen = None
         self._snap = None
+        self._pointer_probe = None
         self.update()
         super().leaveEvent(ev)
 
@@ -511,20 +527,6 @@ class CadCanvas(QWidget):
             painter.drawText(QPointF(0, 0), str(text))
         painter.restore()
 
-    def _entity_outline(self, painter, entity, tol):
-        """Traca o contorno da entidade com a caneta ja escolhida."""
-        vp = self.vp
-        if entity.dxftype() in POINT_LIKE:
-            p = entity_insert_point(entity)
-            if p is not None:
-                x, y = vp.world_to_screen(p)
-                painter.drawRect(QRectF(x - 5, y - 5, 10, 10))
-            return
-        for poly in entity_polylines(entity, tol):
-            pts = [QPointF(*vp.world_to_screen(p)) for p in poly]
-            if len(pts) >= 2:
-                painter.drawPolyline(QPolygonF(pts))
-
     def _paint_hover(self, painter):
         """Realce leve da entidade sob o cursor, antes de clicar."""
         tool = self.ctx.tool
@@ -539,7 +541,23 @@ class CadCanvas(QWidget):
         pen = QPen(color, 3.0)
         pen.setCosmetic(True)
         painter.setPen(pen)
-        self._entity_outline(painter, e, self.vp.flatten_tolerance(0.5))
+        key = (
+            e.dxf.get("handle"),
+            self.doc.geometry_revision,
+            self.vp.center.x,
+            self.vp.center.y,
+            self.vp.scale,
+            self.vp.width,
+            self.vp.height,
+        )
+        if key != self._hover_key:
+            self._hover_shapes = self._outline_shapes(e, self.vp.flatten_tolerance(0.65))
+            self._hover_key = key
+        for shape in self._hover_shapes:
+            if isinstance(shape, QRectF):
+                painter.drawRect(shape)
+            else:
+                painter.drawPolyline(shape)
 
     def _selection_key(self) -> tuple:
         vp = self.vp
@@ -604,9 +622,15 @@ class CadCanvas(QWidget):
             x, y = vp.world_to_screen(p)
             return [QRectF(x - 5, y - 5, 10, 10)]
         out = []
-        for poly in entity_polylines(entity, tol):
-            if len(poly) >= 2:
-                out.append(QPolygonF([QPointF(*vp.world_to_screen(p)) for p in poly]))
+        for poly in entity_point_lists(entity, tol):
+            if len(poly) < 2:
+                continue
+            if len(poly) > 8:
+                poly = decimate(poly, tol)
+            if len(poly) > MAX_OUTLINE_VERTS:
+                stride = math.ceil((len(poly) - 1) / (MAX_OUTLINE_VERTS - 1))
+                poly = [*poly[::stride], poly[-1]]
+            out.append(QPolygonF([QPointF(*vp.world_to_screen_xy(x, y)) for x, y in poly]))
         return out
 
     def _paint_selection(self, painter):

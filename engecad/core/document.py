@@ -336,6 +336,10 @@ class Document:
     # ---------------- indice espacial ----------------
 
     def rebuild_index(self) -> None:
+        # Limpa dados da geometria anterior antes do bbox. O proprio bbox deixa
+        # polilinhas grandes sem bulge num cache compacto, reutilizado pelo
+        # renderizador para nao reler dezenas de milhares de tags por zoom.
+        invalidate_primitives()
         self._by_handle.clear()
         items = []
         for e in self.msp:
@@ -346,7 +350,6 @@ class Document:
             items.append((h, entity_bbox(e)))
         self.index.build(items)
         self.invalidate_layer_cache()
-        invalidate_primitives()
         self._dirty_all = True
         self._dirty_handles.clear()
         self.geometry_revision += 1
@@ -379,9 +382,9 @@ class Document:
         h = entity.dxf.get("handle")
         if h is None:
             return
+        self._mark_dirty(h)
         self._by_handle[h] = entity
         self.index.insert(h, entity_bbox(entity))
-        self._mark_dirty(h)
 
     def _index_update(self, entity) -> None:
         """Reposiciona a entidade no indice apos a geometria mudar."""
@@ -389,9 +392,9 @@ class Document:
         if h is None:
             return
         self.index.remove(h)
+        self._mark_dirty(h)
         self.index.insert(h, entity_bbox(entity))
         self._by_handle[h] = entity
-        self._mark_dirty(h)
 
     def _index_remove(self, entity) -> None:
         h = entity.dxf.get("handle")

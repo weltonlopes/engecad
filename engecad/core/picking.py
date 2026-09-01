@@ -8,6 +8,9 @@ Como no AutoCAD, a janela tem dois sentidos:
 
 from __future__ import annotations
 
+import heapq
+from dataclasses import dataclass
+
 from .entities import (
     POINT_LIKE,
     closest_on_segments,
@@ -17,6 +20,10 @@ from .entities import (
     entity_segments,
 )
 from .geometry import BBox, Vec2, line_intersection
+
+MAX_PROBE_CANDIDATES = 512
+MAX_PROBE_SCAN = 1_024
+MIN_PROBE_FRACTION = 8.0 / 14.0  # cobre integralmente o pickbox dentro do snap
 
 
 def entity_distance(entity, p: Vec2, sagitta: float = 0.01) -> float:
@@ -55,7 +62,72 @@ def _box_distance(box: BBox, p: Vec2) -> float:
     return (dx * dx + dy * dy) ** 0.5
 
 
-def pick_at(doc, p: Vec2, tol: float, exclude=()):
+@dataclass(frozen=True, slots=True)
+class PointerProbe:
+    """Candidatos de uma unica consulta do ponteiro, ordenados pelo bbox."""
+
+    point: Vec2
+    radius: float
+    ranked: tuple[tuple[float, object], ...]
+    truncated: bool = False
+
+
+def probe_at(doc, p: Vec2, radius: float, exclude=()) -> PointerProbe:
+    """Consulta compartilhada por snap e hover.
+
+    Camadas travadas continuam aqui porque participam do snap; ``pick_at`` as
+    elimina ao consumir o probe. A ordenacao inclui o handle para que empates de
+    bboxes grandes nao dependam da ordem de um ``set``.
+    """
+    boxes = doc.index._boxes
+
+    def key(handle):
+        box = boxes.get(handle)
+        return (_box_distance(box, p) if box is not None else 0.0, str(handle))
+
+    excluded_handles = {
+        str(handle)
+        for entity in exclude
+        if (handle := entity.dxf.get("handle")) is not None
+    }
+    query = BBox(p.x - radius, p.y - radius, p.x + radius, p.y + radius)
+    handles = doc.index.query(query)
+    truncated = False
+    if len(handles) > MAX_PROBE_SCAN:
+        # Em zoom extremamente aberto o raio do snap pode conter dezenas de
+        # milhares de objetos. A regiao interna ainda cobre todo o raio de hover
+        # (8 px) e fornece os candidatos espacialmente mais relevantes.
+        inner = radius * MIN_PROBE_FRACTION
+        inner_query = BBox(p.x - inner, p.y - inner, p.x + inner, p.y + inner)
+        nearby = doc.index.query(inner_query)
+        if len(nearby) >= 64:
+            handles = nearby
+        if len(handles) > MAX_PROBE_SCAN:
+            handles = set(heapq.nsmallest(MAX_PROBE_SCAN, handles, key=key))
+        truncated = True
+
+    # O probe alimenta snap e hover, ambos sob orçamento. Ordenar 28 mil
+    # entidades para consumir 64 custava dezenas de milissegundos; um heap
+    # mantem somente a vizinhanca que realmente pode ser refinada.
+    nearest = heapq.nsmallest(MAX_PROBE_CANDIDATES + 1, handles, key=key)
+    heap_truncated = len(nearest) > MAX_PROBE_CANDIDATES
+    if heap_truncated:
+        nearest.pop()
+    ranked = []
+    for handle in nearest:
+        if str(handle) in excluded_handles:
+            continue
+        entity = doc.entity_by_handle(handle)
+        if entity is None or not entity.is_alive:
+            continue
+        if not doc.layer_is_visible(entity.dxf.get("layer", "0")):
+            continue
+        ranked.append((key(handle)[0], entity))
+    ranked.sort(key=lambda item: (item[0], str(item[1].dxf.get("handle", ""))))
+    return PointerProbe(p, radius, tuple(ranked), truncated or heap_truncated)
+
+
+def pick_at(doc, p: Vec2, tol: float, exclude=(), probe: PointerProbe | None = None):
     """Entidade mais proxima de p dentro do raio tol, ou None.
 
     Roda a cada movimento do mouse. Com o zoom aberto o raio de captura vale
@@ -66,20 +138,19 @@ def pick_at(doc, p: Vec2, tol: float, exclude=()):
     Ordenando por esse piso, o primeiro acerto costuma ser o vencedor e o corte
     dispensa o resto sem tocar na geometria.
     """
-    boxes = doc.index._boxes
-    candidates = []
-    for e in doc.query_point(p, tol):
-        if not e.is_alive or e in exclude or not _visible(doc, e):
-            continue
-        box = boxes.get(e.dxf.get("handle"))
-        candidates.append((_box_distance(box, p) if box is not None else 0.0, e))
-    candidates.sort(key=lambda item: item[0])
+    if probe is not None and probe.point == p and probe.radius >= tol:
+        candidates = probe.ranked
+    else:
+        candidates = probe_at(doc, p, tol, exclude).ranked
+    excluded = set(exclude)
 
     best, best_d = None, float("inf")
     sagitta = tol * 0.1
     for floor, e in candidates:
         if floor > tol or floor >= best_d:
             break  # dai em diante nenhuma pode ganhar
+        if not e.is_alive or e in excluded or not _visible(doc, e):
+            continue
         d = entity_distance(e, p, sagitta)
         if d <= tol and d < best_d:
             best, best_d = e, d

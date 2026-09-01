@@ -162,9 +162,14 @@ class SelectTool(Tool):
             self.pick.move(world, screen)
             return
         tol = vp.px_to_world(PICK_TOL_PX)
-        self.hover = pick_at(self.ctx.doc, world, tol)
+        # O canvas ja consultou o maior raio para o snap. Reusar o mesmo probe
+        # elimina uma segunda passagem pelo indice e mantem o hover sob a
+        # posicao fisica do cursor, nao sob o ponto para o qual o snap puxou.
+        probe = getattr(self.ctx.canvas, "_pointer_probe", None)
+        hover_world = probe.point if probe is not None else world
+        self.hover = pick_at(self.ctx.doc, hover_world, tol, probe=probe)
         self.hover_grip = nearest_grip(
-            self.visible_grips(), world, vp.px_to_world(GRIP_TOL_PX)
+            self.visible_grips(), hover_world, vp.px_to_world(GRIP_TOL_PX)
         )
 
     def on_click(self, world: Vec2, event=None) -> None:

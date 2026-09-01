@@ -9,6 +9,7 @@ curva ficar lisa quando o usuario aproxima.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 
 import numpy as np
 from ezdxf import bbox as ezbbox
@@ -31,6 +32,11 @@ _COMPOSITE = DIMENSION_TYPES | {"INSERT"}
 # indefinidamente.
 _MAX_PRIMITIVE_CACHE = 30_000
 _primitive_cache: dict[str, list] = {}
+_MAX_PROXY_CACHE = 8_192
+_proxy_cache: OrderedDict[str, list[list[tuple[float, float]]] | None] = OrderedDict()
+_MAX_POLYLINE_POINTS = 1_000_000
+_polyline_cache: OrderedDict[str, list[tuple[float, float, float]]] = OrderedDict()
+_polyline_points = 0
 
 
 def entity_primitives(entity) -> list:
@@ -162,14 +168,53 @@ def closest_on_segments(segs, x: float, y: float):
 
 def invalidate_primitives(handle: str | None = None) -> None:
     """Descarta o cache de primitivas de uma entidade, ou de todas."""
+    global _polyline_points
     if handle is None:
         _primitive_cache.clear()
         _block_text.clear()
         _segment_cache.clear()
+        _proxy_cache.clear()
+        _polyline_cache.clear()
+        _polyline_points = 0
     else:
         _primitive_cache.pop(handle, None)
+        _proxy_cache.pop(handle, None)
+        old = _polyline_cache.pop(handle, None)
+        if old is not None:
+            _polyline_points -= len(old)
         for key in [k for k in _segment_cache if k[0] == handle]:
             del _segment_cache[key]
+
+
+def _proxy_points(entity):
+    """Geometria proxy quente compartilhada por bbox, render, snap e hover."""
+    handle = entity.dxf.get("handle")
+    if handle is None:
+        return proxy_point_lists(entity.proxy_graphic)
+    if handle in _proxy_cache:
+        hit = _proxy_cache[handle]
+        _proxy_cache.move_to_end(handle)
+        return hit
+    hit = proxy_point_lists(entity.proxy_graphic)
+    _proxy_cache[handle] = hit
+    if len(_proxy_cache) > _MAX_PROXY_CACHE:
+        _proxy_cache.popitem(last=False)
+    return hit
+
+
+def _cache_polyline(handle: str | None, points: list[tuple[float, float, float]]) -> None:
+    """Guarda polilinhas grandes ja lidas pelo calculo de bbox."""
+    global _polyline_points
+    if handle is None or len(points) < 1024:
+        return
+    old = _polyline_cache.pop(handle, None)
+    if old is not None:
+        _polyline_points -= len(old)
+    _polyline_cache[handle] = points
+    _polyline_points += len(points)
+    while _polyline_points > _MAX_POLYLINE_POINTS and len(_polyline_cache) > 1:
+        _, old = _polyline_cache.popitem(last=False)
+        _polyline_points -= len(old)
 
 
 def entity_polylines(
@@ -282,26 +327,23 @@ def _fast_points(entity, dxftype: str, sagitta: float):
         if dxftype == "LWPOLYLINE":
             if not _is_plan(entity):
                 return None
+            handle = entity.dxf.get("handle")
+            raw = _polyline_cache.get(handle) if handle is not None else None
+            if raw is not None:
+                _polyline_cache.move_to_end(handle)
+            else:
+                raw = [(p[0], p[1], p[4]) for p in entity.lwpoints]
             # Ler os vertices e detectar bulge na MESMA passada. `has_arc`
             # percorre a polilinha inteira por conta propria, e uma curva de
             # nivel tem centenas de vertices: a checagem separada custava tanto
             # quanto o resto do achatamento.
-            pts = []
-            for p in entity.lwpoints:
-                if p[4]:  # bulge: o arco vai pelo caminho generico
-                    return None
-                pts.append((p[0], p[1]))
-            if len(pts) < 2:
-                return []
-            if entity.closed and _apart(pts[0], pts[-1]):
-                pts.append(pts[0])
-            return [pts]
+            return _flatten_lwpolyline(raw, bool(entity.closed), sagitta)
 
         if dxftype == "HATCH":
             return _hatch_boundary_points(entity)
 
         if dxftype == "ACAD_PROXY_ENTITY":
-            return proxy_point_lists(entity.proxy_graphic)
+            return _proxy_points(entity)
 
         if dxftype == "CIRCLE":
             if not _is_plan(entity):
@@ -350,6 +392,72 @@ def _hatch_boundary_points(hatch):
             pts.append(pts[0])
         out.append(pts)
     return out
+
+
+def _flatten_lwpolyline(raw, closed: bool, sagitta: float):
+    """Achatamento direto de LWPOLYLINE, inclusive segmentos com bulge."""
+    if len(raw) < 2:
+        return []
+    pairs = list(zip(raw, raw[1:], strict=False))
+    if closed:
+        pairs.append((raw[-1], raw[0]))
+    out = [(raw[0][0], raw[0][1])]
+    for start, end in pairs:
+        x0, y0, bulge = start
+        x1, y1 = end[0], end[1]
+        if abs(bulge) <= 1e-15:
+            out.append((x1, y1))
+            continue
+        dx, dy = x1 - x0, y1 - y0
+        chord = math.hypot(dx, dy)
+        if chord <= 1e-15:
+            out.append((x1, y1))
+            continue
+        theta = 4.0 * math.atan(bulge)
+        radius = chord * (1.0 + bulge * bulge) / (4.0 * abs(bulge))
+        offset = chord * (1.0 - bulge * bulge) / (4.0 * bulge)
+        mx, my = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+        cx, cy = mx - dy / chord * offset, my + dx / chord * offset
+        s = min(max(sagitta, 1e-12), radius)
+        step = 2.0 * math.acos(max(-1.0, min(1.0, 1.0 - s / radius)))
+        count = max(1, min(4096, int(math.ceil(abs(theta) / max(step, 1e-6)))))
+        a0 = math.atan2(y0 - cy, x0 - cx)
+        delta = theta / count
+        for i in range(1, count):
+            angle = a0 + delta * i
+            out.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+        out.append((x1, y1))
+    return [out]
+
+
+def _lwpolyline_bbox(raw, closed: bool) -> BBox:
+    """BBox exato dos vertices e quadrantes dos arcos definidos por bulge."""
+    xs = [p[0] for p in raw]
+    ys = [p[1] for p in raw]
+    pairs = list(zip(raw, raw[1:], strict=False))
+    if closed and len(raw) > 1:
+        pairs.append((raw[-1], raw[0]))
+    for start, end in pairs:
+        x0, y0, bulge = start
+        if abs(bulge) <= 1e-15:
+            continue
+        x1, y1 = end[0], end[1]
+        dx, dy = x1 - x0, y1 - y0
+        chord = math.hypot(dx, dy)
+        if chord <= 1e-15:
+            continue
+        theta = 4.0 * math.atan(bulge)
+        radius = chord * (1.0 + bulge * bulge) / (4.0 * abs(bulge))
+        offset = chord * (1.0 - bulge * bulge) / (4.0 * bulge)
+        mx, my = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+        cx, cy = mx - dy / chord * offset, my + dx / chord * offset
+        a0 = math.atan2(y0 - cy, x0 - cx)
+        for quadrant in (0.0, math.pi / 2, math.pi, 3 * math.pi / 2):
+            span = (quadrant - a0) % math.tau if theta > 0 else (a0 - quadrant) % math.tau
+            if span <= abs(theta) + 1e-12:
+                xs.append(cx + radius * math.cos(quadrant))
+                ys.append(cy + radius * math.sin(quadrant))
+    return BBox(min(xs), min(ys), max(xs), max(ys))
 
 
 def _arc_points(cx, cy, r, a0, a1, sagitta, closed: bool = False):
@@ -419,21 +527,17 @@ def _fast_bbox(entity) -> BBox | None:
         if t == "ACAD_PROXY_ENTITY":
             # O extrator generico do ezdxf custa 1.8 ms por proxy; num
             # levantamento com 126 mil pontos sao quatro minutos so de indice.
-            polys = proxy_point_lists(entity.proxy_graphic)
+            polys = _proxy_points(entity)
             if polys is None:
                 return None
             return _bbox_of(polys)
 
         if t == "LWPOLYLINE":
-            pts = entity.get_points("xy")
-            if not pts:
+            raw = entity.get_points("xyb")
+            if not raw:
                 return BBox()
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            # O bulge pode estufar o arco para fora do poligono dos vertices; a
-            # folga de meia corda cobre o caso sem achatar a polilinha inteira.
-            slack = max(max(xs) - min(xs), max(ys) - min(ys)) * 0.5 if entity.has_arc else 0.0
-            return BBox(min(xs) - slack, min(ys) - slack, max(xs) + slack, max(ys) + slack)
+            _cache_polyline(dxf.get("handle"), [(p[0], p[1], p[2]) for p in raw])
+            return _lwpolyline_bbox(raw, bool(entity.closed))
     except (AttributeError, TypeError, ValueError):
         return None
     return None
