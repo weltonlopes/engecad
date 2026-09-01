@@ -39,6 +39,10 @@ MAX_GRID_LINES = 400
 # continuo mostramos o cache esticado e refinamos quando o movimento para.
 SLOW_FRAME_MS = 25.0
 REFINE_MS = 70  # espera antes do redesenho fino, em ms
+# Orcamento de cada fatia do redesenho. Abaixo de um quadro de 60 Hz, para o
+# canvas devolver o controle ao Qt antes de a interface parecer travada.
+STEP_BUDGET_MS = 12.0
+FIRST_STEP_BUDGET_MS = 60.0  # a primeira fatia acomoda um desenho comum inteiro
 MAX_OUTLINES = 2_000  # contornos de selecao/realce desenhados por quadro
 TEXT_TYPES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 
@@ -68,6 +72,11 @@ class CadCanvas(QWidget):
         self._refine = QTimer(self)
         self._refine.setSingleShot(True)
         self._refine.timeout.connect(self._finish_gesture)
+        # Continua um redesenho fatiado na proxima volta do laco de eventos.
+        self._advance = QTimer(self)
+        self._advance.setSingleShot(True)
+        self._advance.setInterval(0)
+        self._advance.timeout.connect(self.update)
         ctx.documentReplaced.connect(self._on_document_replaced)
         # Qualquer mutacao do documento (geometria, cor ou visibilidade de
         # camada) invalida o quadro guardado; a display list so reconstroi os
@@ -257,7 +266,14 @@ class CadCanvas(QWidget):
     # ---------------- cena (rasters + grade + geometria) ----------------
 
     def _draw_scene(self, painter):
-        """Coloca a cena na tela, redesenhando-a so quando o cache nao serve."""
+        """Coloca a cena na tela, redesenhando-a so quando o cache nao serve.
+
+        Um redesenho pesado nao acontece de uma vez: ele avanca um pedaco por
+        quadro, dentro de um orcamento de tempo, e o canvas mostra o que ja foi
+        montado. Entre um pedaco e o outro o controle volta ao Qt, entao o mouse,
+        o teclado e as ferramentas continuam respondendo enquanto o desenho
+        aparece.
+        """
         vp = self.vp
         frame = self._frame
         if frame.is_exact(vp):
@@ -270,20 +286,47 @@ class CadCanvas(QWidget):
             frame.blit(painter, vp)
             self._refine.start(REFINE_MS)
             return
-        frame.render(vp, self.devicePixelRatioF(), self._paint_scene_content)
+        if not frame.building_for(vp):
+            frame.begin(vp, self.devicePixelRatioF(), self._scene_steps)
+        # A primeira fatia e generosa: um desenho comum fecha nela, e nao paga
+        # uma volta a toa no laco de eventos. So a cena que estoura esse limite
+        # passa a ser desenhada aos pedacos.
+        done = frame.step(STEP_BUDGET_MS if frame.started else FIRST_STEP_BUDGET_MS)
         frame.blit(painter, vp)
+        if not done:
+            self._advance.start(0)  # devolve o controle ao laco e continua
 
-    def _paint_scene_content(self, painter, vp):
+    def render_scene_now(self) -> None:
+        """Completa a cena sem depender do laco de eventos (testes, exportacao)."""
+        self._frame.render_now(self.vp, self.devicePixelRatioF(), self._scene_steps)
+
+    def _scene_steps(self, vp):
+        """Etapas do quadro, na ordem em que valem mais para quem olha.
+
+        Gerador, e nao lista: o planejamento da geometria so acontece depois que
+        a display list terminou de se preparar, e essa preparacao tambem e uma
+        etapa com orcamento.
+        """
+        yield lambda p, deadline: self._paint_base(p, vp)
+        yield lambda p, deadline: self._display.prepare(deadline)
+        # Decidir o que desenhar tambem custa (culling e escolha de nivel sobre
+        # centenas de milhares de linhas), entao tem fatia propria.
+        planned = []
+        yield lambda p, deadline: bool(
+            planned.append(self._display.plan(vp, self.theme is DARK, self.devicePixelRatioF()))
+            or True
+        )
+        geometry, markers = planned[0]
+        yield from geometry
+        if markers:
+            yield lambda p, deadline: self._paint_markers(p, vp, markers)
+
+    def _paint_base(self, painter, vp) -> bool:
         painter.fillRect(0, 0, vp.width, vp.height, self.theme.q("background"))
         self._paint_rasters(painter, vp)
         if self.show_grid:
             self._paint_grid(painter, vp)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        markers = self._display.paint(
-            painter, vp, self.theme is DARK, self.devicePixelRatioF()
-        )
-        if markers:
-            self._paint_markers(painter, vp, markers)
+        return True
 
     def _paint_rasters(self, painter, vp):
         for layer in self.ctx.rasters:
@@ -327,7 +370,7 @@ class CadCanvas(QWidget):
 
     # ---------------- rotulos (texto, ponto, atributo, cota) ----------------
 
-    def _paint_markers(self, painter, vp, entities):
+    def _paint_markers(self, painter, vp, entities) -> bool:
         """Desenha o que depende do tamanho da fonte em pixels, e so isso.
 
         A geometria dessas entidades ja veio da display list; aqui entra apenas o
@@ -336,6 +379,7 @@ class CadCanvas(QWidget):
         """
         doc = self.doc
         dark = self.theme is DARK
+        painter.setRenderHint(QPainter.Antialiasing, True)
         font = QFont(painter.font())
         colors: dict[str, int] = {}
         for e in entities:
@@ -360,6 +404,7 @@ class CadCanvas(QWidget):
                 self._paint_text_primitive(painter, vp, e, font)
             elif t == "INSERT" or t in DIMENSION_TYPES:
                 self._paint_composite_text(painter, vp, e, font, centered=t in DIMENSION_TYPES)
+        return True
 
     def _paint_point_marker(self, painter, vp, e):
         p = entity_insert_point(e)

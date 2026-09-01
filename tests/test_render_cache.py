@@ -9,6 +9,7 @@ continuar achando o mesmo ponto mesmo com o orcamento de candidatos.
 
 import math
 import os
+import time
 
 import pytest
 
@@ -220,6 +221,85 @@ def test_zoom_invalidates_the_frame_cache(scene):
     canvas.render(QImage(400, 300, QImage.Format_ARGB32_Premultiplied))
     ctx.viewport.set_scale(ctx.viewport.scale * 2)
     assert not canvas._frame.is_exact(ctx.viewport)
+
+
+# ---------------- desenho progressivo ----------------
+
+
+@pytest.fixture
+def crowded(qapp):
+    """Desenho grande o bastante para o quadro nao caber numa fatia so."""
+    doc = Document.new()
+    for i in range(6000):
+        x = E + (i % 100) * 3.0
+        y = N + (i // 100) * 3.0
+        doc.msp.add_lwpolyline([(x, y), (x + 2, y), (x + 2, y + 2), (x, y + 2)], close=True)
+    doc.rebuild_index()
+    ctx = AppContext(doc)
+    canvas = CadCanvas(ctx)
+    canvas.show_grid = False
+    canvas.resize(400, 300)
+    ctx.viewport.resize(400, 300)
+    ctx.zoom_extents()
+    yield ctx, canvas
+    canvas.deleteLater()
+
+
+def test_heavy_frame_is_drawn_in_slices(crowded):
+    """Cada fatia devolve o controle; o quadro so vale quando fecha."""
+    ctx, canvas = crowded
+    img = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    slices = 0
+    while not canvas._frame.complete:
+        assert not canvas._frame.is_exact(ctx.viewport), "quadro parcial nao pode valer"
+        canvas.render(img)
+        slices += 1
+        assert slices < 500, "o quadro nunca fechou"
+    assert slices > 1, "este desenho deveria precisar de mais de uma fatia"
+    assert canvas._frame.is_exact(ctx.viewport)
+
+
+def test_progressive_result_matches_the_direct_one(crowded):
+    """Fatiar muda quando o desenho aparece, nunca o que aparece."""
+    ctx, canvas = crowded
+    fatiado = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    while not canvas._frame.complete:
+        canvas.render(fatiado)
+
+    canvas.invalidate_scene()
+    canvas._display.clear()
+    canvas.render_scene_now()
+    assert canvas._frame.complete
+    direto = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    canvas.render(direto)
+    assert fatiado == direto
+
+
+def test_render_scene_now_needs_no_event_loop(crowded):
+    ctx, canvas = crowded
+    canvas.invalidate_scene()
+    canvas.render_scene_now()
+    assert canvas._frame.complete
+    assert canvas._frame.is_exact(ctx.viewport)
+
+
+def test_partial_rebuild_never_reaches_the_planner():
+    """Planejar com a display list pela metade descreveria o desenho errado."""
+    doc = Document.new()
+    for i in range(2000):
+        doc.msp.add_line((E + i, N), (E + i, N + 5))
+    doc.rebuild_index()
+    ctx = AppContext(doc)
+    display = ctx.canvas._display if ctx.canvas else None
+    if display is None:
+        canvas = CadCanvas(ctx)
+        display = canvas._display
+    # um prazo ja vencido: a preparacao tem de parar no meio e admitir isso
+    assert display.prepare(time.perf_counter() - 1.0) is False
+    assert len(display._slot) < 2000
+    while not display.prepare(None):
+        pass
+    assert len(display._slot) == 2000
 
 
 # ---------------- precisao do rebase ----------------

@@ -28,11 +28,13 @@ regiao que o usuario olhou de fato ocupa memoria.
 
 from __future__ import annotations
 
+import itertools
 import math
+import time
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QTransform
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QTransform
 
 from ..core.dimensions import DIMENSION_TYPES
 from ..core.entities import POINT_LIKE, entity_point_lists
@@ -46,6 +48,9 @@ MAX_LEVEL_ESCALATION = 2  # teto da escalada: tinta nunca engole nada > ~8 px
 MAX_CACHED_VERTS = 3_000_000  # teto do cache de tiles, em vertices
 MAX_MARKERS = 3_000  # textos/pontos rotulados por quadro
 MAX_HATCH_LINES = 5_000  # linhas de padrao por hachura
+# Conferir o relogio a cada entidade custaria mais que processar uma; a cada 512
+# o desvio do orcamento fica bem abaixo de um milissegundo.
+_CHUNK = 512
 
 # Largura da caneta da geometria, em pixels. Nao aumentar sem medir: o motor
 # raster do Qt tem um caminho rapido para caneta cosmetica de ate 1 px, e passar
@@ -63,15 +68,64 @@ _MARKER = 2  # precisa de rotulo desenhado por quadro (texto, ponto, atributo)
 _MARKER_TYPES = POINT_LIKE | DIMENSION_TYPES | {"ATTRIB"}
 
 
+class _InkPass:
+    """A passada de tinta, fatiada em lotes.
+
+    Com o zoom bem aberto sao centenas de milhares de entidades sub-pixel; fazer
+    o scatter de uma vez custa dezenas de milissegundos e estoura o orcamento da
+    fatia. A imagem so vai para a tela quando o ultimo lote entra.
+    """
+
+    BATCH = 40_000
+
+    def __init__(self, display, vp, idx, dark, dpr):
+        self.display = display
+        self.vp = vp
+        self.idx = idx
+        self.dark = dark
+        self.dpr = dpr
+        self.at = 0
+        self.buf = None
+
+    def __call__(self, painter, deadline) -> bool:
+        w = max(1, int(round(self.vp.width * self.dpr)))
+        h = max(1, int(round(self.vp.height * self.dpr)))
+        if self.buf is None:
+            self.buf = self.display._ink_buffer(w, h)
+        while self.at < self.idx.size:
+            stop = min(self.at + self.BATCH, self.idx.size)
+            self.display._scatter_ink(
+                self.buf, self.vp, self.idx[self.at : stop], self.dark, self.dpr
+            )
+            self.at = stop
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+        if self.at < self.idx.size:
+            return False
+        img = QImage(self.buf.data, w, h, w * 4, QImage.Format_RGBA8888)
+        img.setDevicePixelRatio(self.dpr)
+        painter.save()
+        painter.resetTransform()
+        painter.drawImage(0, 0, img)
+        painter.restore()
+        return True
+
+
 class _Cell:
-    """Geometria de um tile numa oitava de zoom, agrupada por caneta."""
+    """Geometria de um tile numa oitava de zoom, agrupada por caneta.
 
-    __slots__ = ("strokes", "fills", "verts")
+    `pending` guarda as entidades que ainda faltam assar. Um tile denso leva
+    dezenas de milissegundos para ser construido; poder parar no meio e o que
+    permite fatiar a regeneracao sem travar a interface.
+    """
 
-    def __init__(self):
+    __slots__ = ("strokes", "fills", "verts", "pending")
+
+    def __init__(self, pending: list[int] | None = None):
         self.strokes: dict[tuple, QPainterPath] = {}
         self.fills: dict[tuple, QPainterPath] = {}
         self.verts = 0
+        self.pending: list[int] = pending or []
 
     def stroke(self, key) -> QPainterPath:
         path = self.strokes.get(key)
@@ -100,6 +154,9 @@ class DisplayList:
         self._slot: dict[str, int] = {}
         self._ents: list = []
         self._free: list[int] = []
+        #: Um a mais que o maior slot ja usado. Os arrays sao alocados com folga
+        #: para o crescimento; varrer so a parte viva corta o culling pela metade.
+        self._high = 0
         self._bbox = np.zeros((0, 4))
         self._size = np.zeros(0)
         self._aci = np.zeros(0, np.int32)
@@ -116,44 +173,50 @@ class DisplayList:
         self._floor_tile = 1.0
         self._ceil_tile = math.inf
         self._measured_n = 0
+        #: Reconstrucao em andamento: (entidades, quantas ja entraram, cores).
+        self._rebuilding: tuple | None = None
+        self._dirty_queue: list[str] = []
         self._rgb: dict[bool, np.ndarray] = {}
         self._ink_buf: np.ndarray | None = None
 
     # ---------------- sincronizacao com o documento ----------------
 
+    def prepare(self, deadline: float | None = None) -> bool:
+        """Absorve as mudancas do documento. True quando esta pronta para desenhar.
+
+        Indexar 200 mil entidades leva quase um segundo -- tempo demais para uma
+        etapa so. O trabalho e fatiado como o resto do quadro, e quem chama
+        insiste ate receber True.
+        """
+        if self.doc.geometry_revision != self._revision:
+            self._revision = self.doc.geometry_revision
+            full, dirty = self.doc.consume_geometry_changes()
+            if full or self._rebuilding is not None:
+                # Mudanca durante uma reconstrucao: recomecar e mais simples do
+                # que costurar o novo estado no meio do antigo, e e raro.
+                self._start_rebuild()
+            else:
+                self._dirty_queue.extend(dirty)
+
+        if self._rebuilding is not None:
+            return self._advance_rebuild(deadline)
+        if self._dirty_queue:
+            return self._advance_dirty(deadline)
+        return True
+
     def sync(self) -> None:
-        """Absorve as mudancas do documento desde o ultimo quadro."""
-        if self.doc.geometry_revision == self._revision:
-            return
-        self._revision = self.doc.geometry_revision
-        full, dirty = self.doc.consume_geometry_changes()
-        if full:
-            self._rebuild()
-            return
-        for handle in dirty:
-            self._refresh_slot(handle)
-        # Um desenho que comeca vazio e cresce muda de densidade: quando o porte
-        # do documento dobra, a grade de tiles e redimensionada.
-        n = len(self._slot)
-        if n > 2 * self._measured_n or n * 2 < self._measured_n:
-            self._measure_density()
-            self.clear()
+        """Absorve tudo de uma vez. Atalho para quem nao fatia."""
+        while not self.prepare(None):
+            pass
 
-    def clear(self) -> None:
-        self._cells.clear()
-        self._order.clear()
-        self._verts = 0
-        self._buckets = None
-
-    def _rebuild(self) -> None:
+    def _start_rebuild(self) -> None:
+        """Prepara a varredura do modelspace. As entidades vem por lotes."""
         doc = self.doc
-        ents = [e for e in doc.msp if e.is_alive and e.dxf.get("handle") is not None]
-        n = len(ents)
-        cap = max(n * 2, 64)
-
+        cap = max(len(doc) * 2, 64)
         self._slot = {}
         self._ents = [None] * cap
-        self._free = list(range(n, cap))
+        self._free = []
+        self._high = 0
         self._bbox = np.full((cap, 4), np.nan)
         self._size = np.zeros(cap)
         self._aci = np.zeros(cap, np.int32)
@@ -161,18 +224,75 @@ class DisplayList:
         self._flags = np.zeros(cap, np.uint8)
         self._layer_ids = {}
         self._layer_names = []
+        self._dirty_queue.clear()
         self.clear()
+        self._rebuilding = (iter(doc.msp), {})
 
-        boxes = doc.index._boxes
-        colors: dict[str, int] = {}
-        for i, e in enumerate(ents):
-            handle = e.dxf.get("handle")
-            self._slot[handle] = i
-            self._ents[i] = e
-            self._fill_slot(i, e, boxes.get(handle), colors)
-
+    def _advance_rebuild(self, deadline: float | None) -> bool:
+        source, colors = self._rebuilding
+        boxes = self.doc.index._boxes
+        done = False
+        while True:
+            batch = list(itertools.islice(source, _CHUNK))
+            if not batch:
+                done = True
+                break
+            for e in batch:
+                handle = e.dxf.get("handle")
+                if handle is None or not e.is_alive:
+                    continue
+                i = self._high
+                if i >= len(self._ents):
+                    self._grow()
+                self._high = i + 1
+                self._slot[handle] = i
+                self._ents[i] = e
+                self._fill_slot(i, e, boxes.get(handle), colors)
+            if deadline is not None and time.perf_counter() >= deadline:
+                break
+        if not done:
+            return False
+        self._rebuilding = None
+        self._free = list(range(self._high, len(self._ents)))
         self._origin = self._pick_origin()
         self._measure_density()
+        return True
+
+    def _grow(self) -> None:
+        old = len(self._ents)
+        extra = max(old, 64)
+        self._ents.extend([None] * extra)
+        self._bbox = np.vstack([self._bbox, np.full((extra, 4), np.nan)])
+        self._size = np.concatenate([self._size, np.zeros(extra)])
+        self._aci = np.concatenate([self._aci, np.zeros(extra, np.int32)])
+        self._layer = np.concatenate([self._layer, np.zeros(extra, np.int32)])
+        self._flags = np.concatenate([self._flags, np.zeros(extra, np.uint8)])
+
+    def _advance_dirty(self, deadline: float | None) -> bool:
+        queue = self._dirty_queue
+        done = 0
+        for handle in queue:
+            self._refresh_slot(handle)
+            done += 1
+            if deadline is not None and done % _CHUNK == 0 and time.perf_counter() >= deadline:
+                break
+        del queue[:done]
+        if queue:
+            return False
+        # Um desenho que comeca vazio e cresce muda de densidade: quando o porte
+        # do documento dobra, a grade de tiles e redimensionada.
+        n = len(self._slot)
+        if n > 2 * self._measured_n or n * 2 < self._measured_n:
+            self._origin = self._pick_origin()
+            self._measure_density()
+            self.clear()
+        return True
+
+    def clear(self) -> None:
+        self._cells.clear()
+        self._order.clear()
+        self._verts = 0
+        self._buckets = None
 
     def _pick_origin(self) -> tuple[float, float]:
         """Canto do desenho, arredondado, usado como zero das coordenadas locais."""
@@ -243,18 +363,13 @@ class DisplayList:
         self._buckets = None
 
     def _alloc(self) -> int:
-        if self._free:
-            return self._free.pop()
-        old = len(self._ents)
-        cap = max(old * 2, 64)
-        self._ents.extend([None] * (cap - old))
-        self._bbox = np.vstack([self._bbox, np.full((cap - old, 4), np.nan)])
-        self._size = np.concatenate([self._size, np.zeros(cap - old)])
-        self._aci = np.concatenate([self._aci, np.zeros(cap - old, np.int32)])
-        self._layer = np.concatenate([self._layer, np.zeros(cap - old, np.int32)])
-        self._flags = np.concatenate([self._flags, np.zeros(cap - old, np.uint8)])
-        self._free = list(range(old + 1, cap))
-        return old
+        if not self._free:
+            old = len(self._ents)
+            self._grow()
+            self._free = list(range(old, len(self._ents)))
+        i = self._free.pop()
+        self._high = max(self._high, i + 1)
+        return i
 
     def _drop_cells_at(self, box) -> None:
         """Descarta os tiles que cobrem `box`, em todas as oitavas."""
@@ -341,14 +456,23 @@ class DisplayList:
 
     # ---------------- desenho ----------------
 
-    def paint(self, painter, vp, dark: bool = True, dpr: float = 1.0) -> list:
-        """Desenha a geometria e devolve as entidades que o canvas deve rotular."""
+    def plan(self, vp, dark: bool = True, dpr: float = 1.0) -> tuple[list, list]:
+        """Monta a lista de etapas de desenho e as entidades a rotular.
+
+        Cada etapa e `f(painter, deadline)` e devolve True quando terminou. Um
+        tile ainda nao construido consome varias chamadas ate ficar pronto, de
+        modo que nem a construcao nem a rasterizacao travem a interface.
+
+        Exige prepare() concluido: com uma reconstrucao pela metade os arrays
+        ainda nao descrevem o desenho.
+        """
         self.sync()
         if not self._slot:
-            return []
+            return [], []
 
         vis = vp.visible_bbox()
-        bb = self._bbox
+        n = self._high
+        bb = self._bbox[:n]
         with np.errstate(invalid="ignore"):
             m = (
                 (bb[:, 2] >= vis.minx)
@@ -357,10 +481,10 @@ class DisplayList:
                 & (bb[:, 1] <= vis.maxy)
             )
         visible = self._visible_layers()
-        m &= visible[self._layer]
+        m &= visible[self._layer[:n]]
         idx = np.flatnonzero(m)
         if idx.size == 0:
-            return []
+            return [], []
 
         upw = 1.0 / max(vp.scale, 1e-12)
         level = self._choose_level(upw, idx)
@@ -379,9 +503,25 @@ class DisplayList:
             ink = np.concatenate([ink, markers])
             markers = markers[:0]
 
-        self._paint_ink(painter, vp, ink, dark, dpr)
-        self._paint_vectors(painter, vp, vectors, level, dark, visible)
-        return [self._ents[i] for i in markers.tolist() if self._ents[i] is not None]
+        steps = []
+        if ink.size:
+            # A tinta vem primeiro: poe na tela a silhueta do desenho inteiro
+            # enquanto os tiles ainda estao sendo montados.
+            steps.append(_InkPass(self, vp, ink, dark, dpr))
+        for key in self._cell_keys(vp, vectors, level):
+            steps.append(
+                lambda p, d, k=key: self._draw_cell_step(p, vp, level, k, visible, dark, d)
+            )
+        entities = [self._ents[i] for i in markers.tolist() if self._ents[i] is not None]
+        return steps, entities
+
+    def paint(self, painter, vp, dark: bool = True, dpr: float = 1.0) -> list:
+        """Desenha a cena inteira de uma vez. Atalho para quem nao fatia."""
+        steps, entities = self.plan(vp, dark, dpr)
+        for step in steps:
+            while not step(painter, math.inf):
+                pass
+        return entities
 
     def _visible_layers(self) -> np.ndarray:
         doc = self.doc
@@ -400,12 +540,9 @@ class DisplayList:
             self._rgb[dark] = hit
         return hit
 
-    def _paint_ink(self, painter, vp, idx: np.ndarray, dark: bool, dpr: float) -> None:
-        """Entidades sub-pixel: um scatter numpy, uma imagem, um blit."""
-        if idx.size == 0:
-            return
-        w = max(1, int(round(vp.width * dpr)))
-        h = max(1, int(round(vp.height * dpr)))
+    def _scatter_ink(self, buf, vp, idx: np.ndarray, dark: bool, dpr: float) -> None:
+        """Marca na grade de ocupacao as entidades sub-pixel do lote."""
+        h, w = buf.shape[0], buf.shape[1]
         s = vp.scale * dpr
         ax = -vp.center.x * s + w * 0.5
         ay = h * 0.5 + vp.center.y * s
@@ -422,17 +559,9 @@ class DisplayList:
         keep = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
         if not keep.any():
             return
-
-        buf = self._ink_buffer(w, h)
         iy, ix = iy[keep], ix[keep]
         buf[iy, ix, 0:3] = self._rgb_table(dark)[np.clip(aci[keep], 0, 259)]
         buf[iy, ix, 3] = 255
-        img = QImage(buf.data, w, h, w * 4, QImage.Format_RGBA8888)
-        img.setDevicePixelRatio(dpr)
-        painter.save()
-        painter.resetTransform()
-        painter.drawImage(0, 0, img)
-        painter.restore()
 
     def _ink_buffer(self, w: int, h: int) -> np.ndarray:
         """Buffer da tinta, reaproveitado entre quadros.
@@ -448,11 +577,14 @@ class DisplayList:
             buf[:] = 0
         return buf
 
-    def _paint_vectors(
-        self, painter, vp, idx: np.ndarray, level: int, dark: bool, visible: np.ndarray
-    ) -> None:
+    def _cell_keys(self, vp, idx: np.ndarray, level: int) -> list:
+        """Tiles a desenhar, do centro da vista para fora.
+
+        A ordem importa no desenho progressivo: numa regeneracao longa o usuario
+        ve primeiro o que esta olhando, e a periferia chega depois.
+        """
         if idx.size == 0:
-            return
+            return []
         ox, oy = self._origin
         ts = self._tile_size(level)
         vis = vp.visible_bbox()
@@ -461,10 +593,24 @@ class DisplayList:
         ty0 = int(math.floor((vis.miny - oy) / ts)) - 1
         ty1 = int(math.floor((vis.maxy - oy) / ts)) + 1
         if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 4096:  # vista absurda: nada a fazer
-            return
+            return []
 
+        cx, cy = vp.center.x - ox, vp.center.y - oy
+        keys = []
+        for tx in range(tx0, tx1 + 1):
+            for ty in range(ty0, ty1 + 1):
+                dx = (tx + 0.5) * ts - cx
+                dy = (ty + 0.5) * ts - cy
+                keys.append((dx * dx + dy * dy, (tx, ty)))
+        keys.sort(key=lambda item: item[0])
+        # O balde dos grandes demais atravessa a vista inteira: vem antes.
+        return [(None, None)] + [k for _, k in keys]
+
+    def _transform(self, vp) -> QTransform:
+        """Local -> tela. Os numeros que chegam ao Qt sao pequenos; ver o topo."""
+        ox, oy = self._origin
         s = vp.scale
-        world = QTransform(
+        return QTransform(
             s,
             0.0,
             0.0,
@@ -472,36 +618,38 @@ class DisplayList:
             (ox - vp.center.x) * s + vp.width * 0.5,
             vp.height * 0.5 + (vp.center.y - oy) * s,
         )
-        cells = [self._cell(level, None, None)]
-        for tx in range(tx0, tx1 + 1):
-            for ty in range(ty0, ty1 + 1):
-                cells.append(self._cell(level, tx, ty))
+
+    def _draw_cell_step(self, painter, vp, level, key, visible, dark, deadline) -> bool:
+        """Constroi o tile dentro do orcamento e, quando pronto, desenha."""
+        cell = self._cell(level, key[0], key[1], deadline)
+        if cell.pending:
+            return False  # a construcao continua na proxima fatia de tempo
 
         painter.save()
-        painter.setWorldTransform(world, True)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setWorldTransform(self._transform(vp), True)
         try:
-            # Preenchimentos primeiro, e de todos os tiles: uma hachura nao pode
-            # cobrir a geometria de um tile vizinho desenhado antes dela.
-            # O tile guarda a geometria agrupada por camada justamente para que
-            # apagar uma camada seja pular um grupo, e nao reconstruir o cache.
+            # Preenchimento antes do traco: uma hachura nao pode cobrir a
+            # geometria que a delimita. O tile guarda a geometria agrupada por
+            # camada justamente para que apagar uma camada seja pular um grupo,
+            # e nao reconstruir o cache.
             painter.setPen(Qt.NoPen)
-            for cell in cells:
-                for key, path in cell.fills.items():
-                    if not visible[key[0]]:
-                        continue
-                    painter.setBrush(QBrush(self._qcolor(key, dark)))
-                    painter.drawPath(path)
+            for k, path in cell.fills.items():
+                if not visible[k[0]]:
+                    continue
+                painter.setBrush(QBrush(self._qcolor(k, dark)))
+                painter.drawPath(path)
             painter.setBrush(Qt.NoBrush)
-            for cell in cells:
-                for key, path in cell.strokes.items():
-                    if not visible[key[0]]:
-                        continue
-                    pen = QPen(self._qcolor(key, dark), STROKE_WIDTH)
-                    pen.setCosmetic(True)  # espessura em pixels, nao em metros
-                    painter.setPen(pen)
-                    painter.drawPath(path)
+            for k, path in cell.strokes.items():
+                if not visible[k[0]]:
+                    continue
+                pen = QPen(self._qcolor(k, dark), STROKE_WIDTH)
+                pen.setCosmetic(True)  # espessura em pixels, nao em metros
+                painter.setPen(pen)
+                painter.drawPath(path)
         finally:
             painter.restore()
+        return True
 
     @staticmethod
     def _qcolor(key, dark: bool) -> QColor:
@@ -515,23 +663,33 @@ class DisplayList:
 
     # ---------------- construcao dos tiles ----------------
 
-    def _cell(self, level: int, tx, ty) -> _Cell | None:
+    def _cell(self, level: int, tx, ty, deadline: float | None = None) -> _Cell:
+        """Tile pronto para desenho, ou parcialmente construido se o tempo acabou."""
         key = (level, tx, ty)
         cell = self._cells.get(key)
-        if cell is not None:
+        if cell is None:
+            cell = _Cell(self._members(level, tx, ty))
+            self._cells[key] = cell
+            self._order.append(key)
+        else:
             try:
                 self._order.remove(key)
             except ValueError:
                 pass
             self._order.append(key)
-            return cell
-        cell = self._build_cell(level, tx, ty)
-        self._cells[key] = cell
-        self._order.append(key)
-        self._verts += cell.verts
-        while self._verts > MAX_CACHED_VERTS and len(self._order) > 1:
-            self._forget(self._order[0])
+        if cell.pending:
+            self._bake_pending(cell, level, deadline)
+            if not cell.pending:
+                self._evict()
         return cell
+
+    def _evict(self) -> None:
+        """Descarta os tiles menos usados quando o cache passa do teto."""
+        while self._verts > MAX_CACHED_VERTS and len(self._order) > 1:
+            victim = self._order[0]
+            if self._cells[victim].pending:  # nao joga fora o que esta sendo feito
+                break
+            self._forget(victim)
 
     def _bucket_arrays(self, level: int):
         """Indices de tile e mascara de vetor para a oitava, calculados uma vez."""
@@ -540,40 +698,51 @@ class DisplayList:
         ox, oy = self._origin
         ts = self._tile_size(level)
         thr = self._threshold(level)
-        bb = self._bbox
+        n = self._high
+        bb = self._bbox[:n]
         with np.errstate(invalid="ignore"):
             cx = (bb[:, 0] + bb[:, 2]) * 0.5 - ox
             cy = (bb[:, 1] + bb[:, 3]) * 0.5 - oy
-            big = (self._flags & _GEOMETRY).astype(bool) & (self._size >= thr)
+            big = (self._flags[:n] & _GEOMETRY).astype(bool) & (self._size[:n] >= thr)
             big &= np.isfinite(cx) & np.isfinite(cy)
             tx = np.where(big, np.floor(np.nan_to_num(cx) / ts), 0).astype(np.int64)
             ty = np.where(big, np.floor(np.nan_to_num(cy) / ts), 0).astype(np.int64)
         self._buckets = (level, tx, ty, big)
         return tx, ty, big
 
-    def _build_cell(self, level: int, tx, ty) -> _Cell:
+    def _members(self, level: int, tx, ty) -> list[int]:
+        """Entidades que pertencem ao tile nesta oitava."""
         tx_all, ty_all, big = self._bucket_arrays(level)
         ts = self._tile_size(level)
+        size = self._size[: self._high]
         if tx is None:
             # Uma entidade maior que o proprio tile nao cabe na grade: vai para o
             # balde dos grandes, desenhado sempre. Sao poucas, por definicao.
-            sel = np.flatnonzero(big & (self._size > ts))
+            sel = np.flatnonzero(big & (size > ts))
         else:
-            sel = np.flatnonzero(big & (self._size <= ts) & (tx_all == tx) & (ty_all == ty))
+            sel = np.flatnonzero(big & (size <= ts) & (tx_all == tx) & (ty_all == ty))
+        return sel.tolist()
 
-        cell = _Cell()
-        if sel.size == 0:
-            return cell
+    def _bake_pending(self, cell: _Cell, level: int, deadline: float | None) -> None:
+        """Assa a fila do tile ate o prazo. O que sobrar fica para a proxima."""
         ox, oy = self._origin
         sagitta = self._sagitta(level)
         layers = self._layer
         acis = self._aci
-        for i in sel.tolist():
+        pending = cell.pending
+        done = 0
+        for i in pending:
             entity = self._ents[i]
-            if entity is None or not entity.is_alive:
-                continue
-            self._bake(cell, entity, sagitta, ox, oy, int(layers[i]), int(acis[i]))
-        return cell
+            done += 1
+            if entity is not None and entity.is_alive:
+                before = cell.verts
+                self._bake(cell, entity, sagitta, ox, oy, int(layers[i]), int(acis[i]))
+                self._verts += cell.verts - before
+            # Conferir o relogio a cada entidade seria mais caro que assar uma:
+            # a granularidade de 64 mantem o desvio do orcamento abaixo de 1 ms.
+            if deadline is not None and done % 64 == 0 and time.perf_counter() >= deadline:
+                break
+        del pending[:done]
 
     def _bake(self, cell: _Cell, entity, sagitta: float, ox: float, oy: float,
               layer: int, aci: int) -> None:
