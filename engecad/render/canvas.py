@@ -9,7 +9,7 @@ QTransform com valores de magnitude UTM chega ao motor de rasterizacao.
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from ..core.dimensions import DIMENSION_TYPES, dimension_primitives
@@ -255,7 +255,9 @@ class CadCanvas(QWidget):
         dark = self.theme is DARK
 
         font = QFont(painter.font())
-        for e in doc.query(vis):
+        # Preenchimentos ficam atras da geometria que os delimita.
+        entities = sorted(doc.query(vis), key=lambda item: item.dxftype() != "HATCH")
+        for e in entities:
             if not e.is_alive:
                 continue
             layer = e.dxf.get("layer", "0")
@@ -268,6 +270,9 @@ class CadCanvas(QWidget):
             painter.setPen(pen)
 
             t = e.dxftype()
+            if t == "HATCH":
+                self._paint_hatch(painter, e, tol)
+                continue
             if t in DIMENSION_TYPES:
                 self._paint_dimension(painter, e, tol, font)
                 continue
@@ -278,6 +283,47 @@ class CadCanvas(QWidget):
                 pts = [QPointF(*vp.world_to_screen(p)) for p in poly]
                 if len(pts) >= 2:
                     painter.drawPolyline(QPolygonF(pts))
+
+    def _paint_hatch(self, painter, hatch, tol):
+        """Desenha SOLID e padroes usando o recorte calculado pelo ezdxf."""
+        vp = self.vp
+        color = QColor(painter.pen().color())
+        try:
+            alpha = int(round(255 * (1.0 - float(hatch.transparency))))
+        except (TypeError, ValueError):
+            alpha = 255
+        color.setAlpha(max(25, min(alpha, 255)))
+        if bool(hatch.dxf.get("solid_fill", 0)):
+            path = QPainterPath()
+            path.setFillRule(Qt.OddEvenFill)
+            for poly in entity_polylines(hatch, tol):
+                if len(poly) < 3:
+                    continue
+                sx, sy = vp.world_to_screen(poly[0])
+                path.moveTo(sx, sy)
+                for point in poly[1:]:
+                    path.lineTo(*vp.world_to_screen(point))
+                path.closeSubpath()
+            painter.save()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(color))
+            painter.drawPath(path)
+            painter.restore()
+            return
+        pen = QPen(color, 1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        try:
+            for index, line in enumerate(hatch.render_pattern_lines()):
+                if index >= 20000:  # protege a interface de escala acidentalmente minuscula
+                    break
+                start, end = line
+                painter.drawLine(
+                    QPointF(*vp.world_to_screen(Vec2(start.x, start.y))),
+                    QPointF(*vp.world_to_screen(Vec2(end.x, end.y))),
+                )
+        except (ValueError, ZeroDivisionError):
+            return
 
     def _paint_point_like(self, painter, e, dxftype, font):
         vp = self.vp
@@ -309,8 +355,49 @@ class CadCanvas(QWidget):
             else:
                 painter.drawText(QPointF(sx, sy), str(text))
             return
-        # INSERT e outros: marcador simples
+        if dxftype == "INSERT":
+            self._paint_insert(painter, e, font)
+            return
         painter.drawRect(QRectF(sx - 3, sy - 3, 6, 6))
+
+    def _paint_insert(self, painter, insert, font):
+        """Expande a referencia para exibir blocos e carimbos no canvas."""
+        from ezdxf.disassemble import recursive_decompose
+
+        primitives = list(recursive_decompose([insert]))
+        primitives.extend(insert.attribs)
+        tol = self.vp.flatten_tolerance(0.3)
+        for primitive in primitives:
+            t = primitive.dxftype()
+            if t in ("TEXT", "MTEXT", "ATTRIB", "ATTDEF"):
+                self._paint_text_primitive(painter, primitive, font)
+                continue
+            for poly in entity_polylines(primitive, tol):
+                points = [QPointF(*self.vp.world_to_screen(p)) for p in poly]
+                if len(points) >= 2:
+                    painter.drawPolyline(QPolygonF(points))
+
+    def _paint_text_primitive(self, painter, entity, font):
+        p = entity_insert_point(entity)
+        if p is None:
+            return
+        sx, sy = self.vp.world_to_screen(p)
+        t = entity.dxftype()
+        attr = "char_height" if t == "MTEXT" else "height"
+        height = float(entity.dxf.get(attr, 1.0) or 1.0)
+        px = self.vp.world_to_px(height)
+        if px < 3:
+            painter.drawLine(QPointF(sx, sy), QPointF(sx + 4, sy))
+            return
+        font.setPixelSize(max(3, int(px)))
+        painter.setFont(font)
+        text = entity.text if t == "MTEXT" else entity.dxf.get("text", "")
+        rotation = float(entity.dxf.get("rotation", 0.0) or 0.0)
+        painter.save()
+        painter.translate(sx, sy)
+        painter.rotate(-rotation)
+        painter.drawText(QPointF(0, 0), str(text))
+        painter.restore()
 
     def _paint_dimension(self, painter, entity, tol, font):
         """Desenha o bloco anonimo nativo da entidade DIMENSION."""

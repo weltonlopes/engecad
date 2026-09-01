@@ -15,6 +15,8 @@ nao existe matriz inversa nenhuma.
 
 from __future__ import annotations
 
+import copy
+
 SUPPORTED = {
     "LINE",
     "LWPOLYLINE",
@@ -27,6 +29,7 @@ SUPPORTED = {
     "INSERT",
     "DIMENSION",
     "ARC_DIMENSION",
+    "HATCH",
 }
 
 
@@ -109,6 +112,19 @@ def snapshot(entity) -> dict | None:
             "rotation": float(dxf.get("rotation", 0.0)),
             "xscale": float(dxf.get("xscale", 1.0)),
             "yscale": float(dxf.get("yscale", 1.0)),
+            "zscale": float(dxf.get("zscale", 1.0)),
+            "attribs": [(str(a.dxf.tag), str(a.dxf.text)) for a in entity.attribs],
+        }
+
+    if t == "HATCH":
+        return {
+            "_t": t,
+            "dxf": copy.deepcopy(entity.dxfattribs()),
+            "paths": copy.deepcopy(entity.paths),
+            "pattern": copy.deepcopy(entity.pattern),
+            "gradient": copy.deepcopy(entity.gradient),
+            "seeds": copy.deepcopy(entity.seeds),
+            "xdata": copy.deepcopy(entity.xdata),
         }
 
     if t in ("DIMENSION", "ARC_DIMENSION"):
@@ -201,6 +217,36 @@ def restore(entity, snap: dict | None) -> bool:
         dxf.rotation = snap["rotation"]
         dxf.xscale = snap["xscale"]
         dxf.yscale = snap["yscale"]
+        dxf.zscale = snap["zscale"]
+        values = dict(snap.get("attribs", ()))
+        for attrib in entity.attribs:
+            if attrib.dxf.tag in values:
+                attrib.dxf.text = values[attrib.dxf.tag]
+        return True
+
+    if t == "HATCH":
+        protected = {"handle", "owner"}
+        for attr in (
+            "solid_fill", "pattern_name", "associative", "hatch_style", "pattern_type",
+            "pattern_angle", "pattern_scale", "pattern_double", "color", "transparency",
+        ):
+            if attr not in snap["dxf"] and dxf.hasattr(attr):
+                dxf.discard(attr)
+        for attr, value in snap["dxf"].items():
+            if attr not in protected:
+                setattr(dxf, attr, copy.deepcopy(value))
+        entity.paths = copy.deepcopy(snap["paths"])
+        entity.pattern = copy.deepcopy(snap["pattern"])
+        entity.gradient = copy.deepcopy(snap["gradient"])
+        entity.seeds = copy.deepcopy(snap["seeds"])
+        entity.xdata = copy.deepcopy(snap["xdata"])
+        handle = dxf.get("handle")
+        if entity.doc is not None and handle:
+            for path in entity.paths:
+                for source_handle in path.source_boundary_objects:
+                    source = entity.doc.entitydb.get(source_handle)
+                    if source is not None:
+                        source.append_reactor_handle(handle)
         return True
 
     if t in ("DIMENSION", "ARC_DIMENSION"):

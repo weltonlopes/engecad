@@ -18,6 +18,7 @@ from .tools.dimension import (
     ReassociateDimensionTool,
 )
 from .tools.draw import LineTool, PolylineTool
+from .tools.hatch import edit_hatch, edit_title_block, start_hatch, start_title_block
 from .tools.measure import AreaTool, DistanceTool
 from .tools.modify import (
     CopyTool,
@@ -55,6 +56,30 @@ def register_builtin_commands(reg) -> None:
     reg.register(
         "TEXT", lambda ctx, *a: TextTool(ctx), ("T", "TEXTO"),
         "Insere um texto", "desenho",
+    )
+    reg.register(
+        "HATCH", start_hatch, ("H", "HACHURA"),
+        "Cria hachura por contorno selecionado ou ponto interno", "desenho",
+    )
+    reg.register(
+        "HATCHEDIT", edit_hatch, ("HE", "HACHURAEDITAR"),
+        "Edita padrao, escala, angulo, cor e ilhas", "desenho", False,
+    )
+    reg.register(
+        "HATCHREGEN", _hatch_regen, ("HREGEN",),
+        "Regenera as hachuras associativas", "desenho", False,
+    )
+    reg.register(
+        "HATCHDISASSOCIATE", _hatch_disassociate, ("HDESASSOCIAR",),
+        "Remove os vinculos da hachura selecionada", "desenho", False,
+    )
+    reg.register(
+        "CARIMBO", start_title_block, ("TITLEBLOCK",),
+        "Insere carimbo configuravel como bloco DXF", "desenho",
+    )
+    reg.register(
+        "CARIMBOEDIT", edit_title_block, ("TITLEBLOCKEDIT",),
+        "Edita os atributos do carimbo selecionado", "desenho", False,
     )
 
     # ---- cotas DXF nativas ----
@@ -389,3 +414,27 @@ def _dimension_regen(ctx, *args):
     if changed:
         ctx.doc._touch()
     ctx.message(f"{len(dimensions)} cota(s) associativa(s) regenerada(s)")
+
+
+def _hatch_regen(ctx, *args):
+    from .core.hatches import associated_hatches
+
+    selected = [e for e in ctx.selection if e.dxftype() == "HATCH"]
+    hatches = selected or associated_hatches(ctx.doc)
+    changed = ctx.doc._update_associative_hatches(hatches=hatches)
+    if changed:
+        ctx.doc._touch()
+    ctx.message(f"{len(changed)}/{len(hatches)} hachura(s) regenerada(s)")
+
+
+def _hatch_disassociate(ctx, *args):
+    from .core.hatches import detach_hatch
+
+    hatches = [e for e in ctx.selection if e.dxftype() == "HATCH"]
+    if not hatches:
+        ctx.message("Selecione uma ou mais hachuras")
+        return
+    with ctx.doc.editing(hatches, "desassociar hachuras"):
+        for hatch in hatches:
+            detach_hatch(hatch)
+    ctx.message(f"{len(hatches)} hachura(s) desassociada(s)")

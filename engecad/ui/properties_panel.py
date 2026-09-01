@@ -23,6 +23,8 @@ from ..core.dimensions import DIMENSION_TYPES, dimension_kind, dimension_measure
 from ..core.entities import entity_insert_point, entity_polylines
 from ..core.geometry import Vec2, azimuth, format_dms, polygon_area, polyline_length
 from ..core.grips import VERTEX, drag_grip, entity_grips
+from ..core.hatches import hatch_area, hatch_association_status
+from ..core.titleblocks import is_title_block, title_block_metadata, title_block_values
 from ..render.styles import aci_to_qcolor
 from .layer_panel import _nearest_aci
 
@@ -214,7 +216,7 @@ class PropertiesPanel(QWidget):
         doc = self.ctx.doc
         t = entity.dxftype()
         layer = entity.dxf.get("layer", "0")
-        self.lbl_title.setText(t)
+        self.lbl_title.setText("Carimbo" if is_title_block(entity) else t)
 
         self.cmb_layer.setEnabled(True)
         self._set_combo_layer(layer)
@@ -405,6 +407,33 @@ def _entity_measures(entity, doc=None) -> str:
         p = entity_insert_point(entity)
         if p is not None:
             lines.append(f"Insercao: {p.x:.3f}, {p.y:.3f}")
+        if is_title_block(entity):
+            metadata = title_block_metadata(entity)
+            values = title_block_values(entity)
+            lines.append(
+                f"Formato: {metadata.get('paper', '?')} "
+                f"({'paisagem' if metadata.get('landscape', True) else 'retrato'})"
+            )
+            lines.append(f"Escala: 1:{float(metadata.get('scale_denominator', 1)):g}")
+            if values.get("TITULO"):
+                lines.append(f"Titulo: {values['TITULO']}")
+
+    elif t == "HATCH":
+        lines.append(f"Padrao: {dxf.get('pattern_name', 'SOLID')}")
+        if not bool(dxf.get("solid_fill", 0)):
+            lines.append(f"Escala: {float(dxf.get('pattern_scale', 1) or 1):g}")
+            lines.append(f"Angulo: {float(dxf.get('pattern_angle', 0) or 0):g} graus")
+        lines.append(f"Transparencia: {float(entity.transparency or 0) * 100:.0f}%")
+        area = hatch_area(entity)
+        lines.append(f"Area: {area:.3f} m2  ({area / 10000:.4f} ha)")
+        if doc is not None:
+            total, resolved = hatch_association_status(doc, entity)
+            if total == 0:
+                lines.append("Associatividade: nao associada")
+            elif total == resolved:
+                lines.append(f"Associatividade: associada ({resolved}/{total})")
+            else:
+                lines.append(f"Associatividade: orfa ({resolved}/{total})")
 
     elif t in DIMENSION_TYPES:
         kind = dimension_kind(entity)

@@ -14,6 +14,18 @@ from .geometry import BBox, Vec2, distance_to_segment, line_intersection
 
 def entity_distance(entity, p: Vec2, sagitta: float = 0.01) -> float:
     """Menor distancia de p ate a geometria da entidade."""
+    if entity.dxftype() == "HATCH":
+        from shapely.geometry import Point, Polygon
+
+        inside = False
+        point = Point(p.x, p.y)
+        for polyline in entity_polylines(entity, sagitta):
+            if len(polyline) >= 3:
+                polygon = Polygon([(v.x, v.y) for v in polyline])
+                if polygon.is_valid and polygon.covers(point):
+                    inside = not inside
+        if inside:
+            return 0.0
     if entity.dxftype() in POINT_LIKE:
         ins = entity_insert_point(entity)
         return p.distance_to(ins) if ins else float("inf")

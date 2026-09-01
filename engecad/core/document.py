@@ -34,6 +34,14 @@ from .dimensions import (
 )
 from .entities import entity_bbox
 from .geometry import BBox, Vec2
+from .hatches import (
+    HatchSettings,
+    apply_hatch_settings,
+    associated_hatches,
+    set_hatch_boundaries,
+    set_hatch_seed_boundary,
+    update_associative_hatch,
+)
 from .snapshot import restore, snapshot
 from .spatial_index import GridIndex
 from .undo import Command, UndoStack
@@ -75,6 +83,9 @@ class _EntityCommand(Command):
         self.doc._update_associative_dimensions(
             {_entity_handle(e) for e in self.entities if _entity_handle(e)}
         )
+        self.doc._update_associative_hatches(
+            {_entity_handle(e) for e in self.entities if _entity_handle(e)}
+        )
         self.doc._touch()
 
     def _unlink(self) -> None:
@@ -84,6 +95,9 @@ class _EntityCommand(Command):
                 self.doc._index_remove(e)
                 msp.unlink_entity(e)
         self.doc._update_associative_dimensions(
+            {_entity_handle(e) for e in self.entities if _entity_handle(e)}
+        )
+        self.doc._update_associative_hatches(
             {_entity_handle(e) for e in self.entities if _entity_handle(e)}
         )
         self.doc._touch()
@@ -351,6 +365,20 @@ class Document:
                 changed.append(dimension)
         return changed
 
+    def _update_associative_hatches(
+        self, source_handles: set[str] | None = None, hatches: Iterable = ()
+    ) -> list:
+        explicit = {e for e in hatches if e is not None and e.is_alive}
+        targets = set(explicit)
+        if source_handles:
+            targets.update(associated_hatches(self, {str(h) for h in source_handles}))
+        changed = []
+        for hatch in targets:
+            if update_associative_hatch(self, hatch):
+                self._index_update(hatch)
+                changed.append(hatch)
+        return changed
+
     def entity_by_handle(self, handle: str):
         return self._by_handle.get(handle)
 
@@ -564,6 +592,32 @@ class Document:
         )
         return self._add_dimension(obj, "comprimento de arco", associations)
 
+    def add_hatch(
+        self,
+        boundaries: Iterable | None = None,
+        *,
+        seed=None,
+        settings: HatchSettings | None = None,
+        layer: str | None = None,
+    ):
+        """Cria HATCH nativa por contornos selecionados ou por ponto interno."""
+        hatch = self.msp.add_hatch(dxfattribs=self._attribs(layer))
+        try:
+            apply_hatch_settings(hatch, settings or HatchSettings())
+            if seed is not None:
+                set_hatch_seed_boundary(self, hatch, seed)
+            else:
+                set_hatch_boundaries(hatch, list(boundaries or ()))
+        except Exception:
+            self.msp.delete_entity(hatch)
+            raise
+        return self._register_new(hatch, "hachura")
+
+    def add_title_block(self, insert, config):
+        from .titleblocks import add_title_block
+
+        return add_title_block(self, insert, config)
+
     # ---------------- edicao ----------------
 
     @contextmanager
@@ -582,7 +636,8 @@ class Document:
         source_handles = {_entity_handle(e) for e in items if e.dxftype() not in DIMENSION_TYPES}
         source_handles.discard(None)
         dependents = associated_dimensions(self, source_handles) if source_handles else []
-        tracked = list(dict.fromkeys([*items, *dependents]))
+        hatch_dependents = associated_hatches(self, source_handles) if source_handles else []
+        tracked = list(dict.fromkeys([*items, *dependents, *hatch_dependents]))
         before = [(e, snapshot(e)) for e in tracked]
         yield items
         for entity in items:
@@ -590,6 +645,8 @@ class Document:
                 self._index_update(entity)
         explicit_dimensions = [e for e in items if e.dxftype() in DIMENSION_TYPES]
         self._update_associative_dimensions(source_handles, explicit_dimensions)
+        explicit_hatches = [e for e in items if e.dxftype() == "HATCH"]
+        self._update_associative_hatches(source_handles, explicit_hatches)
         records = []
         for entity, antes in before:
             if antes is None or not entity.is_alive:
@@ -628,11 +685,18 @@ class Document:
                 if (old := _entity_handle(original)) and (new := _entity_handle(clone))
             }
             copied_dimensions = []
-            for _, clone in pairs:
+            copied_hatches = []
+            for original, clone in pairs:
                 if clone.dxftype() in DIMENSION_TYPES:
                     remap_dimension_associations(clone, handle_map)
                     copied_dimensions.append(clone)
+                elif clone.dxftype() == "HATCH":
+                    from .hatches import remap_copied_hatch
+
+                    remap_copied_hatch(self, original, clone, handle_map, matrix)
+                    copied_hatches.append(clone)
             self._update_associative_dimensions(dimensions=copied_dimensions)
+            self._update_associative_hatches(hatches=copied_hatches)
             self.undo.push(AddEntities(self, made, name), execute=False)
             self._touch()
         return made

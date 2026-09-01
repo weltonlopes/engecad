@@ -41,6 +41,8 @@ python -m engecad planta.dxf     # abre um desenho direto
 | **Imagem de fundo** | GeoTIFF/COG, JP2, ECW (ver abaixo), reprojeção on-the-fly, leitura decimada por overviews |
 | **Desenho** | linha, polilinha, retângulo, círculo, arco por 3 pontos, texto |
 | **Cotas DXF** | linear, alinhada, rotacionada, angular, raio, diâmetro, arco e ordenada; associativas e com DIMSTYLE métrico |
+| **Hachuras DXF** | sólido, 172 padrões métricos/ANSI e `.PAT`; ilhas, escala, ângulo, cor, transparência, área e limites associativos |
+| **Carimbos** | blocos A0–A4 em paisagem/retrato, escala de plotagem e 13 campos editáveis persistidos como atributos DXF |
 | **Seleção** | clique, janela (→) e captura (←), Shift para somar/tirar, realce ao passar o cursor |
 | **Grips** | esticar vértice, mover entidade, mudar raio e ângulo — arrastando, sem comando |
 | **Edição** | mover, copiar, girar, espelhar, escalar, paralela, aparar, estender, apagar |
@@ -78,6 +80,7 @@ embaixo antes de cada comando.
 | `CIRCLE` `C` | `MIRROR` `MI` | `PAN` `P` |
 | `ARC` `A` | `SCALE` `SC` | `GRADE` `F7` |
 | `TEXT` `T` | `OFFSET` `O` | `OSNAP` `F3` |
+| `HATCH` `H` | `HATCHEDIT` `HE` | `CARIMBO` / `CARIMBOEDIT` |
 | `DIMLINEAR` `DLI` | | |
 | `DIMALIGNED` `DAL` | | |
 | `DIMANGULAR` `DAN` | | |
@@ -100,6 +103,13 @@ origem e acompanham alterações de vértices, raios, MOVE, ROTATE e SCALE. Pont
 digitados permanecem fixos. Se uma origem for apagada, a cota fica órfã sem
 perder seu último valor; `DIMREASSOCIATE` refaz os vínculos e
 `DIMDISASSOCIATE` os remove deliberadamente.
+
+`HATCH` usa os contornos fechados que estiverem selecionados; sem seleção,
+solicita um ponto interno e encontra automaticamente a menor região fechada.
+As hachuras acompanham MOVE, ROTATE, SCALE e edição por grips dos limites. O
+diálogo também carrega padrões AutoCAD `.PAT`. `CARIMBO` insere um bloco nativo
+na escala corrente da vista, com formato A0–A4, orientação, folha, revisão,
+responsável, CREA/CAU, imóvel, matrícula, CRS e demais campos editáveis.
 
 ---
 
@@ -217,7 +227,7 @@ testáveis sem abrir janela.
 pytest -q
 ```
 
-241 testes. Os que mais importam:
+254 testes. Os que mais importam:
 
 - ida e volta `mundo → tela → mundo` com coordenada UTM real (exigido < 1 mm; medido: 0);
 - zoom ancorado 60× sem deriva do ponto sob o cursor;

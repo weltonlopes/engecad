@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 
 from ezdxf import bbox as ezbbox
-from ezdxf.path import make_path
+from ezdxf.path import from_hatch_boundary_path, make_path
 
 from .dimensions import DIMENSION_TYPES, dimension_primitives
 from .geometry import BBox, Vec2
@@ -28,6 +28,19 @@ def entity_polylines(entity, sagitta: float = 0.01) -> list[list[Vec2]]:
     qualquer zoom sem gerar vertices demais quando esta longe.
     """
     dxftype = entity.dxftype()
+    if dxftype == "HATCH":
+        out: list[list[Vec2]] = []
+        for boundary in entity.paths:
+            try:
+                path = from_hatch_boundary_path(boundary)
+                pts = [Vec2(v.x, v.y) for v in path.flattening(max(sagitta, 1e-9))]
+            except (TypeError, ValueError):
+                continue
+            if len(pts) >= 2:
+                if pts[0].distance_to(pts[-1]) > 1e-9:
+                    pts.append(pts[0])
+                out.append(pts)
+        return out
     if dxftype in DIMENSION_TYPES:
         out: list[list[Vec2]] = []
         for primitive in dimension_primitives(entity):

@@ -174,6 +174,16 @@ class MainWindow(QMainWindow):
         m_draw.addAction(self._act("&Circulo", lambda: self.run("CIRCLE"), tip="alias: C"))
         m_draw.addAction(self._act("&Arco (3 pontos)", lambda: self.run("ARC"), tip="alias: A"))
         m_draw.addAction(self._act("&Texto", lambda: self.run("TEXT"), tip="alias: T"))
+        m_draw.addSeparator()
+        m_draw.addAction(self._act("&Hachura...", lambda: self.run("HATCH"), tip="alias: H"))
+        m_draw.addAction(self._act("Editar hac&hura...", lambda: self.run("HATCHEDIT"), tip="HE"))
+        m_draw.addAction(self._act("&Regenerar hachuras", lambda: self.run("HATCHREGEN")))
+        m_draw.addAction(
+            self._act("&Desassociar hachura", lambda: self.run("HATCHDISASSOCIATE"))
+        )
+        m_draw.addSeparator()
+        m_draw.addAction(self._act("&Carimbo configuravel...", lambda: self.run("CARIMBO")))
+        m_draw.addAction(self._act("Editar car&imbo...", lambda: self.run("CARIMBOEDIT")))
 
         m_dim = self.menuBar().addMenu("&Cotas")
         m_dim.addAction(self._act("&Linear", lambda: self.run("DIMLINEAR"), tip="alias: DLI"))
