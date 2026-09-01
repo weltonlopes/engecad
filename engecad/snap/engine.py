@@ -11,13 +11,10 @@ import itertools
 import math
 from dataclasses import dataclass
 
-from ..core.entities import entity_polylines, entity_snap_points
-from ..core.geometry import (
-    Vec2,
-    closest_point_on_segment,
-    distance_to_segment,
-    line_intersection,
-)
+import numpy as np
+
+from ..core.entities import closest_on_segments, entity_segments, entity_snap_points
+from ..core.geometry import Vec2, line_intersection
 
 # Prioridade: menor numero vence empate dentro do raio de captura.
 PRIORITY = {
@@ -54,6 +51,8 @@ DEFAULT_ENABLED = {"end", "mid", "center", "quad", "node", "intersection", "near
 # rodam quando ha poucos candidatos.
 MAX_CANDIDATES = 24
 MAX_FOR_GEOMETRY = 16
+MAX_CROSS_SEGMENTS = 60  # pares de segmentos para intersecao crescem ao quadrado
+MAX_SEGMENT_CACHE = 512  # entidades com a geometria achatada guardada
 
 
 @dataclass(frozen=True)
@@ -154,31 +153,42 @@ class SnapEngine:
         # so valem a pena quando o cursor esta sobre poucas entidades.
         geometry_ok = len(entities) <= MAX_FOR_GEOMETRY
 
-        # Intersecao: so entre segmentos que passam perto do cursor.
-        if geometry_ok and "intersection" in self.enabled and len(entities) > 1:
-            segs = []
+        want_near = geometry_ok and "nearest" in self.enabled
+        want_cross = geometry_ok and "intersection" in self.enabled and len(entities) > 1
+        if want_near or want_cross:
+            sagitta = radius * 0.05
+            near_segments = []
             for e in entities:
-                for poly in entity_polylines(e, sagitta=radius * 0.05):
-                    for i in range(len(poly) - 1):
-                        a, b = poly[i], poly[i + 1]
-                        # distancia ate o SEGMENTO, nao ate os extremos: uma linha
-                        # longa passa sob o cursor com os extremos a dezenas de metros.
-                        if distance_to_segment(world, a, b) < radius * 3:
-                            segs.append((a, b, e))
-            for (a1, a2, e1), (b1, b2, e2) in itertools.combinations(segs[:80], 2):
+                segs = entity_segments(e, sagitta)
+                if segs is None:
+                    continue
+                distances, px, py = closest_on_segments(segs, world.x, world.y)
+                if want_near:
+                    i = int(np.argmin(distances))
+                    consider("nearest", Vec2(float(px[i]), float(py[i])), e)
+                if want_cross:
+                    # So os segmentos que passam perto do cursor entram no
+                    # cruzamento par a par -- a distancia e ate o SEGMENTO, nao
+                    # ate os extremos: uma linha longa passa sob o cursor com os
+                    # extremos a dezenas de metros.
+                    ax, ay, dx, dy = segs
+                    for i in np.flatnonzero(distances < radius * 3).tolist():
+                        near_segments.append(
+                            (
+                                Vec2(float(ax[i]), float(ay[i])),
+                                Vec2(float(ax[i] + dx[i]), float(ay[i] + dy[i])),
+                                e,
+                            )
+                        )
+                        if len(near_segments) >= MAX_CROSS_SEGMENTS:
+                            break
+
+            for (a1, a2, e1), (b1, b2, e2) in itertools.combinations(near_segments, 2):
                 if e1 is e2:
                     continue
                 ip = line_intersection(a1, a2, b1, b2, as_segments=True)
                 if ip is not None:
                     consider("intersection", ip, (e1, e2))
-
-        # Nearest: ponto mais proximo sobre a geometria.
-        if geometry_ok and "nearest" in self.enabled:
-            for e in entities:
-                for poly in entity_polylines(e, sagitta=radius * 0.05):
-                    for i in range(len(poly) - 1):
-                        p = closest_point_on_segment(world, poly[i], poly[i + 1])
-                        consider("nearest", p, e)
 
         if best is None and self.grid_step > 0 and "grid" in self.enabled:
             g = self.grid_step

@@ -91,13 +91,27 @@ class GridIndex:
         """Chaves cujo bbox pode intersectar b (pode devolver falsos positivos)."""
         if b.is_empty or not self._boxes:
             return set()
-        keys = self._keys_for(b)
+        cs = self.cell_size or 1.0
+        x0, y0 = int(math.floor(b.minx / cs)), int(math.floor(b.miny / cs))
+        x1, y1 = int(math.floor(b.maxx / cs)), int(math.floor(b.maxy / cs))
+        cells = (x1 - x0 + 1) * (y1 - y0 + 1)
+
         out: set = set(self._large)
-        if keys is None:
-            return set(self._boxes)
-        for ck in keys:
-            out |= self._cells.get(ck, set())
-        return {k for k in out if self._boxes[k].intersects(b)}
+        if cells > len(self._boxes):
+            # Percorrer a grade sairia mais caro que olhar cada entidade. So
+            # entao vale varrer tudo -- o limite fixo que havia aqui antes fazia
+            # uma consulta grande devolver o desenho inteiro, e com o zoom bem
+            # aberto o raio de captura do snap chega a centenas de metros.
+            out = set(self._boxes)
+        else:
+            get = self._cells.get
+            for x in range(x0, x1 + 1):
+                for y in range(y0, y1 + 1):
+                    hit = get((x, y))
+                    if hit:
+                        out |= hit
+        boxes = self._boxes
+        return {k for k in out if boxes[k].intersects(b)}
 
     def query_point(self, p: Vec2, radius: float) -> set:
         return self.query(BBox(p.x - radius, p.y - radius, p.x + radius, p.y + radius))
