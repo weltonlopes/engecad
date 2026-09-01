@@ -68,6 +68,10 @@ class Tool:
         """Texto vindo da linha de comando (coordenada ou opcao). True se consumiu."""
         return False
 
+    def snap_exclude(self):
+        """Entidades que o osnap deve ignorar enquanto esta ferramenta roda."""
+        return ()
+
     # ---------------- desenho ----------------
 
     def paint(self, painter, viewport) -> None:
@@ -97,12 +101,17 @@ class PointCollectorTool(Tool):
     def __init__(self, ctx):
         super().__init__(ctx)
         self.points: list[Vec2] = []
+        self.point_snaps: list = []
         self.cursor: Vec2 | None = None
+
+    def activate(self) -> None:
+        self.update_prompt()
 
     # -- pontos --
 
-    def add_point(self, p: Vec2) -> None:
+    def add_point(self, p: Vec2, snap=None) -> None:
         self.points.append(p)
+        self.point_snaps.append(snap)
         self.after_point()
         if self.max_points and len(self.points) >= self.max_points:
             self.commit()
@@ -123,7 +132,9 @@ class PointCollectorTool(Tool):
         self.cursor = world
 
     def on_click(self, world: Vec2, event=None) -> None:
-        self.add_point(world)
+        canvas = getattr(self.ctx, "canvas", None)
+        snap = getattr(canvas, "current_snap", None) if canvas is not None else None
+        self.add_point(world, snap)
 
     def on_right_click(self, world: Vec2, event=None) -> None:
         if len(self.points) >= self.min_points:
@@ -137,9 +148,10 @@ class PointCollectorTool(Tool):
         p = parse_coordinate(text, last)
         if p is None:
             return False
-        self.add_point(p)
+        self.add_point(p, None)
         return True
 
     def cancel(self) -> None:
         self.points.clear()
+        self.point_snaps.clear()
         super().cancel()

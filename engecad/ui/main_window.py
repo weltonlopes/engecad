@@ -33,6 +33,7 @@ from ..render.raster_layer import RasterLayer
 from ..scripting.console import PythonConsole
 from .command_line import CommandLine
 from .crs_dialog import CrsDialog
+from .dimension_style_dialog import DimensionStyleDialog
 from .layer_panel import LayerPanel
 from .properties_panel import PropertiesPanel
 
@@ -173,6 +174,37 @@ class MainWindow(QMainWindow):
         m_draw.addAction(self._act("&Circulo", lambda: self.run("CIRCLE"), tip="alias: C"))
         m_draw.addAction(self._act("&Arco (3 pontos)", lambda: self.run("ARC"), tip="alias: A"))
         m_draw.addAction(self._act("&Texto", lambda: self.run("TEXT"), tip="alias: T"))
+        m_draw.addSeparator()
+        m_draw.addAction(self._act("&Hachura...", lambda: self.run("HATCH"), tip="alias: H"))
+        m_draw.addAction(self._act("Editar hac&hura...", lambda: self.run("HATCHEDIT"), tip="HE"))
+        m_draw.addAction(self._act("&Regenerar hachuras", lambda: self.run("HATCHREGEN")))
+        m_draw.addAction(
+            self._act("&Desassociar hachura", lambda: self.run("HATCHDISASSOCIATE"))
+        )
+        m_draw.addSeparator()
+        m_draw.addAction(self._act("&Carimbo configuravel...", lambda: self.run("CARIMBO")))
+        m_draw.addAction(self._act("Editar car&imbo...", lambda: self.run("CARIMBOEDIT")))
+
+        m_dim = self.menuBar().addMenu("&Cotas")
+        m_dim.addAction(self._act("&Linear", lambda: self.run("DIMLINEAR"), tip="alias: DLI"))
+        m_dim.addAction(self._act("&Alinhada", lambda: self.run("DIMALIGNED"), tip="alias: DAL"))
+        m_dim.addAction(self._act("&Rotacionada", lambda: self.run("DIMROTATED"), tip="alias: DRO"))
+        m_dim.addAction(self._act("A&ngular", lambda: self.run("DIMANGULAR"), tip="alias: DAN"))
+        m_dim.addSeparator()
+        m_dim.addAction(self._act("&Raio", lambda: self.run("DIMRADIUS"), tip="alias: DRA"))
+        m_dim.addAction(self._act("&Diametro", lambda: self.run("DIMDIAMETER"), tip="alias: DDI"))
+        m_dim.addAction(
+            self._act("Comprimento de &arco", lambda: self.run("DIMARC"), tip="alias: DAR")
+        )
+        m_dim.addAction(self._act("&Ordenada", lambda: self.run("DIMORDINATE"), tip="alias: DOR"))
+        m_dim.addSeparator()
+        m_dim.addAction(self._act("&Estilo de cotas...", self.on_dimension_style, tip="DIMSTYLE"))
+        m_dim.addAction(
+            self._act("&Reassociar cota", lambda: self.run("DIMREASSOCIATE"), tip="DRE")
+        )
+        m_dim.addAction(
+            self._act("&Desassociar cota", lambda: self.run("DIMDISASSOCIATE"), tip="DDA")
+        )
 
         m_mod = self.menuBar().addMenu("&Modificar")
         m_mod.addAction(self._act("&Mover", lambda: self.run("MOVE"), tip="alias: M"))
@@ -474,6 +506,10 @@ class MainWindow(QMainWindow):
         self._update_title()
         self.ctx.refresh()
         self.ctx.message(f"CRS do projeto: {crs.display}")
+
+    def on_dimension_style(self) -> None:
+        if DimensionStyleDialog.edit(self.ctx.doc, self):
+            self.ctx.message(f"Estilo de cotas {self.ctx.doc.dimension_style_name} atualizado")
 
     # ---------------- scripts ----------------
 

@@ -40,6 +40,9 @@ python -m engecad planta.dxf     # abre um desenho direto
 | **Coordenadas** | CRS via PROJ/pyproj, SIRGAS 2000 / UTM pré-configurado, E/N ao vivo na barra de status |
 | **Imagem de fundo** | GeoTIFF/COG, JP2, ECW (ver abaixo), reprojeção on-the-fly, leitura decimada por overviews |
 | **Desenho** | linha, polilinha, retângulo, círculo, arco por 3 pontos, texto |
+| **Cotas DXF** | linear, alinhada, rotacionada, angular, raio, diâmetro, arco e ordenada; associativas e com DIMSTYLE métrico |
+| **Hachuras DXF** | sólido, 172 padrões métricos/ANSI e `.PAT`; ilhas, escala, ângulo, cor, transparência, área e limites associativos |
+| **Carimbos** | blocos A0–A4 em paisagem/retrato, escala de plotagem e 13 campos editáveis persistidos como atributos DXF |
 | **Seleção** | clique, janela (→) e captura (←), Shift para somar/tirar, realce ao passar o cursor |
 | **Grips** | esticar vértice, mover entidade, mudar raio e ângulo — arrastando, sem comando |
 | **Edição** | mover, copiar, girar, espelhar, escalar, paralela, aparar, estender, apagar |
@@ -77,6 +80,16 @@ embaixo antes de cada comando.
 | `CIRCLE` `C` | `MIRROR` `MI` | `PAN` `P` |
 | `ARC` `A` | `SCALE` `SC` | `GRADE` `F7` |
 | `TEXT` `T` | `OFFSET` `O` | `OSNAP` `F3` |
+| `HATCH` `H` | `HATCHEDIT` `HE` | `CARIMBO` / `CARIMBOEDIT` |
+| `DIMLINEAR` `DLI` | | |
+| `DIMALIGNED` `DAL` | | |
+| `DIMANGULAR` `DAN` | | |
+| `DIMRADIUS` `DRA` | | |
+| `DIMDIAMETER` `DDI` | | |
+| `DIMARC` `DAR` | | |
+| `DIMORDINATE` `DOR` | | |
+| `DIMREASSOCIATE` `DRE` | | |
+| `DIMDISASSOCIATE` `DDA` | | |
 | | `TRIM` `TR` | `CAMADA` `LA` |
 | | `EXTEND` `EX` | `U` / `REDO` |
 | | `ERASE` `E` / `Del` | `AJUDA` `F1` |
@@ -84,6 +97,19 @@ embaixo antes de cada comando.
 
 Dentro de `TRIM` e `EXTEND`, digitar `U` desfaz o último corte sem sair da
 ferramenta. `Enter` no prompt vazio repete o último comando.
+
+As cotas criadas sobre pontos de `OSNAP` ficam associadas às entidades de
+origem e acompanham alterações de vértices, raios, MOVE, ROTATE e SCALE. Pontos
+digitados permanecem fixos. Se uma origem for apagada, a cota fica órfã sem
+perder seu último valor; `DIMREASSOCIATE` refaz os vínculos e
+`DIMDISASSOCIATE` os remove deliberadamente.
+
+`HATCH` usa os contornos fechados que estiverem selecionados; sem seleção,
+solicita um ponto interno e encontra automaticamente a menor região fechada.
+As hachuras acompanham MOVE, ROTATE, SCALE e edição por grips dos limites. O
+diálogo também carrega padrões AutoCAD `.PAT`. `CARIMBO` insere um bloco nativo
+na escala corrente da vista, com formato A0–A4, orientação, folha, revisão,
+responsável, CREA/CAU, imóvel, matrícula, CRS e demais campos editáveis.
 
 ---
 
@@ -129,6 +155,10 @@ copy(e, 12, 0)                # devolve as cópias
 rotate(e, (0,0), 90)          # graus, anti-horário
 scale(e, (0,0), 2.0)
 offset(e, 3.0)                # paralela; >0 = à esquerda do trajeto
+
+add_linear_dimension((0,0), (10,0), (0,2))
+add_aligned_dimension((0,0), (10,5), (5,8))
+add_radius_dimension((20,0), 5, (27,2))
 
 select_all(); selected(); deselect()
 area([(0,0), (10,0), (10,10), (0,10)])       # 100.0
@@ -197,13 +227,15 @@ testáveis sem abrir janela.
 pytest -q
 ```
 
-218 testes. Os que mais importam:
+254 testes. Os que mais importam:
 
 - ida e volta `mundo → tela → mundo` com coordenada UTM real (exigido < 1 mm; medido: 0);
 - zoom ancorado 60× sem deriva do ponto sob o cursor;
 - mover e desfazer devolvendo a coordenada **exata**, e 50 ciclos undo/redo sem deriva;
 - aparar terminando exatamente sobre o círculo (interseção analítica, não achatada);
 - round-trip DXF: criar → salvar → reabrir → geometria idêntica;
+- cotas associativas acompanhando MOVE, SCALE, grips, interseções e alteração de raio,
+  inclusive depois de salvar/reabrir e em ciclos de undo/redo;
 - snap escolhendo o candidato certo por prioridade e por raio em pixels;
 - script no console desfazendo num passo, e script que falha não deixando resíduo;
 - **desenhar sobre a ortofoto e conferir que o DXF salvo tem a coordenada do mundo real;**
@@ -221,7 +253,7 @@ pintados.
 |---|---|
 | 0.1 | ver, desenhar, salvar, console Python |
 | **0.2** | *(atual)* seleção, grips, edição completa, arco/círculo/retângulo/texto |
-| 0.3 | plantas cadastrais: hachura, cotas, blocos, quadro de áreas, memorial descritivo |
+| 0.3 | plantas cadastrais: hachura, blocos, quadro de áreas, memorial descritivo |
 | 0.4 | **AutoLISP**: interpretador próprio + `command`, `entmake`, `ssget`, carga de `.lsp` |
 | 0.5 | espaço papel, escala de plotagem, carimbo, PDF georreferenciado |
 | 0.6 | SHP / GeoPackage / KML, tiles XYZ e WMS |

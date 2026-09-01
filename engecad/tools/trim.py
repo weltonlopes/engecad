@@ -85,6 +85,7 @@ class TrimTool(_EdgeTool):
                     "(ou o tipo nao suporta aparar)"
                 )
                 return
+            self.doc.rebind_replacement_associations(target, result)
             self.doc.delete([target])
         except Exception:
             self.doc.undo.abort_macro()

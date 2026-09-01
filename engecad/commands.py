@@ -7,7 +7,18 @@ acionadores: linha de comando, console Python (api.command) e AutoLISP (v0.4).
 from __future__ import annotations
 
 from .core.coordinput import parse_coordinate
+from .tools.dimension import (
+    AlignedDimensionTool,
+    AngularDimensionTool,
+    ArcLengthDimensionTool,
+    DiameterDimensionTool,
+    LinearDimensionTool,
+    OrdinateDimensionTool,
+    RadiusDimensionTool,
+    ReassociateDimensionTool,
+)
 from .tools.draw import LineTool, PolylineTool
+from .tools.hatch import edit_hatch, edit_title_block, start_hatch, start_title_block
 from .tools.measure import AreaTool, DistanceTool
 from .tools.modify import (
     CopyTool,
@@ -45,6 +56,87 @@ def register_builtin_commands(reg) -> None:
     reg.register(
         "TEXT", lambda ctx, *a: TextTool(ctx), ("T", "TEXTO"),
         "Insere um texto", "desenho",
+    )
+    reg.register(
+        "HATCH", start_hatch, ("H", "HACHURA"),
+        "Cria hachura por contorno selecionado ou ponto interno", "desenho",
+    )
+    reg.register(
+        "HATCHEDIT", edit_hatch, ("HE", "HACHURAEDITAR"),
+        "Edita padrao, escala, angulo, cor e ilhas", "desenho", False,
+    )
+    reg.register(
+        "HATCHREGEN", _hatch_regen, ("HREGEN",),
+        "Regenera as hachuras associativas", "desenho", False,
+    )
+    reg.register(
+        "HATCHDISASSOCIATE", _hatch_disassociate, ("HDESASSOCIAR",),
+        "Remove os vinculos da hachura selecionada", "desenho", False,
+    )
+    reg.register(
+        "CARIMBO", start_title_block, ("TITLEBLOCK",),
+        "Insere carimbo configuravel como bloco DXF", "desenho",
+    )
+    reg.register(
+        "CARIMBOEDIT", edit_title_block, ("TITLEBLOCKEDIT",),
+        "Edita os atributos do carimbo selecionado", "desenho", False,
+    )
+
+    # ---- cotas DXF nativas ----
+    reg.register(
+        "DIMLINEAR", lambda ctx, *a: LinearDimensionTool(ctx), ("DLI", "COTALINEAR"),
+        "Cota linear horizontal/vertical automatica", "cotas",
+    )
+    reg.register(
+        "DIMALIGNED", lambda ctx, *a: AlignedDimensionTool(ctx),
+        ("DAL", "DIM", "COTAALINHADA"), "Cota alinhada a dois pontos", "cotas",
+    )
+    reg.register(
+        "DIMROTATED", lambda ctx, *a: LinearDimensionTool(ctx, ask_angle=True),
+        ("DRO", "COTAROTACIONADA"), "Cota linear em angulo informado", "cotas",
+    )
+    reg.register(
+        "DIMHORIZONTAL", lambda ctx, *a: LinearDimensionTool(ctx, angle=0.0),
+        ("DHO",), "Cota linear horizontal", "cotas",
+    )
+    reg.register(
+        "DIMVERTICAL", lambda ctx, *a: LinearDimensionTool(ctx, angle=90.0),
+        ("DVE",), "Cota linear vertical", "cotas",
+    )
+    reg.register(
+        "DIMANGULAR", lambda ctx, *a: AngularDimensionTool(ctx), ("DAN", "COTAANGULAR"),
+        "Cota angular por vertice e lados", "cotas",
+    )
+    reg.register(
+        "DIMRADIUS", lambda ctx, *a: RadiusDimensionTool(ctx), ("DRA", "COTARAIO"),
+        "Cota o raio de circulo ou arco", "cotas",
+    )
+    reg.register(
+        "DIMDIAMETER", lambda ctx, *a: DiameterDimensionTool(ctx), ("DDI", "COTADIAMETRO"),
+        "Cota o diametro de circulo ou arco", "cotas",
+    )
+    reg.register(
+        "DIMARC", lambda ctx, *a: ArcLengthDimensionTool(ctx), ("DAR", "COTAARCO"),
+        "Cota o comprimento de um arco", "cotas",
+    )
+    reg.register(
+        "DIMORDINATE", lambda ctx, *a: OrdinateDimensionTool(ctx), ("DOR", "COTAORDENADA"),
+        "Cota ordenada X ou Y", "cotas",
+    )
+    reg.register(
+        "DIMSTYLE", _dimension_style, ("D", "COTAESTILO"),
+        "Consulta/altera o estilo de cotas", "cotas", False,
+    )
+    reg.register(
+        "DIMREASSOCIATE", lambda ctx, *a: ReassociateDimensionTool(ctx),
+        ("DRE", "COTAREASSOCIAR"), "Reassocia pontos de uma cota", "cotas",
+    )
+    reg.register(
+        "DIMDISASSOCIATE", _dimension_disassociate, ("DDA", "COTADESASSOCIAR"),
+        "Remove os vinculos associativos das cotas selecionadas", "cotas", False,
+    )
+    reg.register(
+        "DIMREGEN", _dimension_regen, (), "Regenera todas as cotas associativas", "cotas", False
     )
 
     # ---- modificar ----
@@ -240,3 +332,109 @@ def _help(ctx, *args):
         lines.append(f"[{cat}]")
         lines.extend(sorted(by_cat[cat]))
     ctx.message("\n".join(lines))
+
+
+def _dimension_style(ctx, *args):
+    """DIMSTYLE sem argumentos consulta; com chave=valor altera o estilo."""
+    from dataclasses import replace
+
+    settings = ctx.doc.dimension_style_settings()
+    if not args:
+        ctx.message(
+            f"Estilo {ctx.doc.dimension_style_name}: texto={settings.text_height:g}, "
+            f"seta={settings.arrow_size:g}, escala={settings.scale:g}, "
+            f"precisao={settings.precision}, angular={settings.angular_precision}, "
+            f"separador={settings.decimal_separator}, prefixo={settings.prefix!r}, "
+            f"sufixo={settings.suffix!r}"
+        )
+        return
+
+    aliases = {
+        "texto": "text_height", "text": "text_height", "altura": "text_height",
+        "seta": "arrow_size", "arrow": "arrow_size",
+        "escala": "scale", "scale": "scale",
+        "afastamento": "extension_offset", "offset": "extension_offset",
+        "extensao": "extension_beyond", "extension": "extension_beyond",
+        "gap": "text_gap", "folga": "text_gap",
+        "precisao": "precision", "precision": "precision",
+        "angular": "angular_precision",
+        "separador": "decimal_separator", "separator": "decimal_separator",
+        "zeros": "suppress_trailing_zeros",
+        "prefixo": "prefix", "prefix": "prefix",
+        "sufixo": "suffix", "suffix": "suffix",
+    }
+    changes = {}
+    tokens = " ".join(str(a) for a in args).split()
+    for token in tokens:
+        if "=" not in token:
+            ctx.message(f"Opcao invalida: {token}. Use chave=valor")
+            return
+        raw_key, raw_value = token.split("=", 1)
+        key = aliases.get(raw_key.strip().lower())
+        if key is None:
+            ctx.message(f"Opcao de estilo desconhecida: {raw_key}")
+            return
+        value = raw_value.strip().strip('"')
+        try:
+            if key in ("precision", "angular_precision"):
+                changes[key] = int(value)
+            elif key == "suppress_trailing_zeros":
+                changes[key] = value.lower() not in ("0", "nao", "não", "false", "off")
+            elif key in ("decimal_separator", "prefix", "suffix"):
+                changes[key] = value
+            else:
+                changes[key] = float(value.replace(",", "."))
+        except ValueError:
+            ctx.message(f"Valor invalido para {raw_key}: {raw_value}")
+            return
+    updated = replace(settings, **changes)
+    ctx.doc.update_dimension_style(updated)
+    ctx.message(f"Estilo de cotas {ctx.doc.dimension_style_name} atualizado")
+
+
+def _dimension_disassociate(ctx, *args):
+    from .core.associative import detach_dimension_anchor
+    from .core.dimensions import DIMENSION_TYPES
+
+    dimensions = [e for e in ctx.selection if e.dxftype() in DIMENSION_TYPES]
+    if not dimensions:
+        ctx.message("Selecione uma ou mais cotas")
+        return
+    with ctx.doc.editing(dimensions, "desassociar cotas"):
+        for entity in dimensions:
+            detach_dimension_anchor(entity)
+    ctx.message(f"{len(dimensions)} cota(s) desassociada(s)")
+
+
+def _dimension_regen(ctx, *args):
+    from .core.associative import associated_dimensions
+
+    dimensions = associated_dimensions(ctx.doc)
+    changed = ctx.doc._update_associative_dimensions(dimensions=dimensions)
+    if changed:
+        ctx.doc._touch()
+    ctx.message(f"{len(dimensions)} cota(s) associativa(s) regenerada(s)")
+
+
+def _hatch_regen(ctx, *args):
+    from .core.hatches import associated_hatches
+
+    selected = [e for e in ctx.selection if e.dxftype() == "HATCH"]
+    hatches = selected or associated_hatches(ctx.doc)
+    changed = ctx.doc._update_associative_hatches(hatches=hatches)
+    if changed:
+        ctx.doc._touch()
+    ctx.message(f"{len(changed)}/{len(hatches)} hachura(s) regenerada(s)")
+
+
+def _hatch_disassociate(ctx, *args):
+    from .core.hatches import detach_hatch
+
+    hatches = [e for e in ctx.selection if e.dxftype() == "HATCH"]
+    if not hatches:
+        ctx.message("Selecione uma ou mais hachuras")
+        return
+    with ctx.doc.editing(hatches, "desassociar hachuras"):
+        for hatch in hatches:
+            detach_hatch(hatch)
+    ctx.message(f"{len(hatches)} hachura(s) desassociada(s)")

@@ -51,6 +51,29 @@ class ScriptAPI:
     def add_text(self, text, at, height=1.0, layer=None):
         return self.doc.add_text(text, at, height=height, layer=layer)
 
+    def add_linear_dimension(self, p1, p2, base, angle=0.0, layer=None, text="<>"):
+        return self.doc.add_linear_dimension(p1, p2, base, angle, layer=layer, text=text)
+
+    def add_aligned_dimension(self, p1, p2, base, layer=None, text="<>"):
+        return self.doc.add_aligned_dimension(p1, p2, base, layer=layer, text=text)
+
+    def add_angular_dimension(self, center, p1, p2, base, layer=None, text="<>"):
+        return self.doc.add_angular_dimension(center, p1, p2, base, layer=layer, text=text)
+
+    def add_radius_dimension(self, center, radius, placement, layer=None, text="<>"):
+        return self.doc.add_radius_dimension(center, radius, placement, layer=layer, text=text)
+
+    def add_diameter_dimension(self, center, radius, placement, layer=None, text="<>"):
+        return self.doc.add_diameter_dimension(center, radius, placement, layer=layer, text=text)
+
+    def add_ordinate_dimension(self, feature, leader_end, x_type=None, origin=(0, 0), layer=None):
+        return self.doc.add_ordinate_dimension(
+            feature, leader_end, x_type=x_type, origin=origin, layer=layer
+        )
+
+    def add_arc_length_dimension(self, center, p1, p2, base, layer=None, text="<>"):
+        return self.doc.add_arc_length_dimension(center, p1, p2, base, layer=layer, text=text)
+
     def erase(self, entities):
         if not isinstance(entities, (list, tuple, set)):
             entities = [entities]

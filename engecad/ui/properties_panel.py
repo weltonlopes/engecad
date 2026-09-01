@@ -18,9 +18,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core.associative import association_status
+from ..core.dimensions import DIMENSION_TYPES, dimension_kind, dimension_measurement
 from ..core.entities import entity_insert_point, entity_polylines
 from ..core.geometry import Vec2, azimuth, format_dms, polygon_area, polyline_length
 from ..core.grips import VERTEX, drag_grip, entity_grips
+from ..core.hatches import hatch_area, hatch_association_status
+from ..core.titleblocks import is_title_block, title_block_metadata, title_block_values
 from ..render.styles import aci_to_qcolor
 from .layer_panel import _nearest_aci
 
@@ -212,7 +216,7 @@ class PropertiesPanel(QWidget):
         doc = self.ctx.doc
         t = entity.dxftype()
         layer = entity.dxf.get("layer", "0")
-        self.lbl_title.setText(t)
+        self.lbl_title.setText("Carimbo" if is_title_block(entity) else t)
 
         self.cmb_layer.setEnabled(True)
         self._set_combo_layer(layer)
@@ -227,7 +231,7 @@ class PropertiesPanel(QWidget):
             self.btn_bylayer.setEnabled(True)
         self.btn_color.setStyleSheet(f"background-color: {aci_to_qcolor(abs(aci)).name()};")
 
-        self.lbl_measures.setText(_entity_measures(entity))
+        self.lbl_measures.setText(_entity_measures(entity, doc))
 
         self._vertices = [g for g in entity_grips(entity) if g.kind == VERTEX]
         if self._vertices:
@@ -317,9 +321,11 @@ class PropertiesPanel(QWidget):
             return
         with self.ctx.doc.editing([self._entity], "editar vertice"):
             drag_grip(self._entity, grip, target)
-        self.ctx.message(f"Vertice {self._vertex_index + 1} movido para {target.x:.3f}, {target.y:.3f}")
+        self.ctx.message(
+            f"Vertice {self._vertex_index + 1} movido para {target.x:.3f}, {target.y:.3f}"
+        )
         self._vertices = [g for g in entity_grips(self._entity) if g.kind == VERTEX]
-        self.lbl_measures.setText(_entity_measures(self._entity))
+        self.lbl_measures.setText(_entity_measures(self._entity, self.ctx.doc))
         self._refresh_vertex_fields()
 
     def _on_center_vertex(self) -> None:
@@ -340,6 +346,8 @@ def _hline(parent) -> QFrame:
 def _entity_length(entity) -> float:
     """Comprimento/perimetro aproximado, usado no total da selecao multipla."""
     t = entity.dxftype()
+    if t in DIMENSION_TYPES:
+        return 0.0
     if t == "LINE":
         dxf = entity.dxf
         a, b = Vec2(dxf.start.x, dxf.start.y), Vec2(dxf.end.x, dxf.end.y)
@@ -352,7 +360,7 @@ def _entity_length(entity) -> float:
     return total
 
 
-def _entity_measures(entity) -> str:
+def _entity_measures(entity, doc=None) -> str:
     """Descricao das medidas relevantes, uma por linha, para a entidade unica."""
     t = entity.dxftype()
     dxf = entity.dxf
@@ -373,7 +381,8 @@ def _entity_measures(entity) -> str:
         if closed and len(pts) > 1 and pts[0].distance_to(pts[-1]) < 1e-9:
             n_vertices -= 1
         lines.append(f"Vertices: {n_vertices}")
-        lines.append(f"{'Perimetro' if closed else 'Comprimento'}: {polyline_length(pts, closed=closed):.3f} m")
+        label = "Perimetro" if closed else "Comprimento"
+        lines.append(f"{label}: {polyline_length(pts, closed=closed):.3f} m")
         if closed and len(pts) >= 3:
             area = polygon_area(pts)
             lines.append(f"Area: {area:.3f} m2  ({area / 10000:.4f} ha)")
@@ -398,6 +407,52 @@ def _entity_measures(entity) -> str:
         p = entity_insert_point(entity)
         if p is not None:
             lines.append(f"Insercao: {p.x:.3f}, {p.y:.3f}")
+        if is_title_block(entity):
+            metadata = title_block_metadata(entity)
+            values = title_block_values(entity)
+            lines.append(
+                f"Formato: {metadata.get('paper', '?')} "
+                f"({'paisagem' if metadata.get('landscape', True) else 'retrato'})"
+            )
+            lines.append(f"Escala: 1:{float(metadata.get('scale_denominator', 1)):g}")
+            if values.get("TITULO"):
+                lines.append(f"Titulo: {values['TITULO']}")
+
+    elif t == "HATCH":
+        lines.append(f"Padrao: {dxf.get('pattern_name', 'SOLID')}")
+        if not bool(dxf.get("solid_fill", 0)):
+            lines.append(f"Escala: {float(dxf.get('pattern_scale', 1) or 1):g}")
+            lines.append(f"Angulo: {float(dxf.get('pattern_angle', 0) or 0):g} graus")
+        lines.append(f"Transparencia: {float(entity.transparency or 0) * 100:.0f}%")
+        area = hatch_area(entity)
+        lines.append(f"Area: {area:.3f} m2  ({area / 10000:.4f} ha)")
+        if doc is not None:
+            total, resolved = hatch_association_status(doc, entity)
+            if total == 0:
+                lines.append("Associatividade: nao associada")
+            elif total == resolved:
+                lines.append(f"Associatividade: associada ({resolved}/{total})")
+            else:
+                lines.append(f"Associatividade: orfa ({resolved}/{total})")
+
+    elif t in DIMENSION_TYPES:
+        kind = dimension_kind(entity)
+        value = dimension_measurement(entity)
+        unit = "graus" if "angular" in kind else "m"
+        lines.append(f"Tipo: {kind}")
+        lines.append(f"Medida: {value:.3f} {unit}")
+        lines.append(f"Estilo: {dxf.get('dimstyle', 'Standard')}")
+        if doc is not None:
+            total, resolved = association_status(doc, entity)
+            if total == 0:
+                lines.append("Associatividade: nao associada")
+            elif resolved == total:
+                lines.append(f"Associatividade: associada ({resolved}/{total})")
+            else:
+                lines.append(f"Associatividade: orfa ({resolved}/{total})")
+        override = str(dxf.get("text", "<>"))
+        if override not in ("", "<>"):
+            lines.append(f"Texto substituto: {override}")
 
     else:
         polys = entity_polylines(entity, sagitta=0.001)

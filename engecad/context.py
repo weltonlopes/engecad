@@ -39,7 +39,9 @@ class AppContext(QObject):
         self.selection: Selection | None = None
         #: Grip de vertice em foco no painel de propriedades (realce no canvas).
         self.vertex_focus = None
-        self.set_document(doc or Document.new())
+        # `doc or Document.new()` descartaria um documento vazio: Document tem
+        # __len__, entao um desenho sem entidades e falsy.
+        self.set_document(Document.new() if doc is None else doc)
 
         from .commands import register_builtin_commands
 

@@ -1,0 +1,574 @@
+"""Invariantes do motor de renderizacao com cache.
+
+A geometria deixou de ser reconstruida a cada quadro: ela e achatada uma vez,
+guardada em tiles (render/displaylist.py) e o quadro pronto e reaproveitado
+(render/framecache.py). Isso cria obrigacoes novas -- o cache tem de enxergar
+edicoes, o achatamento rapido tem de bater com o generico, e o snap tem de
+continuar achando o mesmo ponto mesmo com o orcamento de candidatos.
+"""
+
+import math
+import os
+import random
+import time
+
+import pytest
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from ezdxf import bbox as ezbbox  # noqa: E402
+from ezdxf.path import make_path  # noqa: E402
+from PySide6.QtGui import QImage  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from engecad.context import AppContext  # noqa: E402
+from engecad.core.document import Document  # noqa: E402
+from engecad.core.entities import _fast_points, entity_bbox, entity_point_lists  # noqa: E402
+from engecad.core.geometry import BBox, Vec2  # noqa: E402
+from engecad.render.canvas import CadCanvas  # noqa: E402
+
+E, N = 674000.0, 7384000.0
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def scene(qapp):
+    """Documento com um punhado de entidades e um canvas montado sobre ele."""
+    doc = Document.new()
+    msp = doc.msp
+    doc.ensure_layer("MURO", 1)
+    msp.add_line((E, N), (E + 40, N + 20), dxfattribs={"layer": "MURO"})
+    msp.add_lwpolyline(
+        [(E, N + 30), (E + 20, N + 30), (E + 20, N + 45), (E, N + 45)],
+        close=True,
+        dxfattribs={"layer": "MURO"},
+    )
+    msp.add_circle((E + 60, N + 20), 8)
+    doc.rebuild_index()
+
+    ctx = AppContext(doc)
+    canvas = CadCanvas(ctx)
+    canvas.show_grid = False  # a grade tambem vira pixel e mascara a contagem
+    canvas.resize(400, 300)
+    ctx.viewport.resize(400, 300)
+    ctx.zoom_extents()
+    yield ctx, canvas
+    canvas.deleteLater()
+
+
+def _ink(canvas, w=400, h=300):
+    """Quantos pixels do quadro nao sao o fundo."""
+    img = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+    canvas.render(img)
+    background = canvas.theme.q("background").rgb()
+    return sum(
+        1
+        for y in range(h)
+        for x in range(w)
+        if img.pixel(x, y) & 0xFFFFFF != background & 0xFFFFFF
+    )
+
+
+# ---------------- achatamento rapido ----------------
+
+
+@pytest.mark.parametrize("radius", [0.05, 2.5, 100.0, 5000.0])
+@pytest.mark.parametrize("sagitta", [0.01, 0.3, 2.0])
+def test_fast_arc_flattening_respects_tolerance(radius, sagitta):
+    """A flecha da poligonal nunca pode passar da tolerancia pedida."""
+    doc = Document.new()
+    arc = doc.msp.add_arc((E, N), radius, 20, 200)
+    pts = _fast_points(arc, "ARC", sagitta)[0]
+    assert pts is not None
+    worst = 0.0
+    for a, b in zip(pts, pts[1:], strict=False):
+        mx, my = (a[0] + b[0]) / 2 - E, (a[1] + b[1]) / 2 - N
+        worst = max(worst, abs(radius - math.hypot(mx, my)))
+    assert worst <= sagitta * 1.01
+    # e todo vertice tem de cair sobre o arco
+    for x, y in pts:
+        assert abs(math.hypot(x - E, y - N) - radius) < radius * 1e-9 + 1e-9
+
+
+def test_fast_flattening_matches_generic_for_polylines():
+    doc = Document.new()
+    poly = doc.msp.add_lwpolyline(
+        [(E, N), (E + 10, N), (E + 10, N + 5), (E, N + 5)], close=True
+    )
+    fast = entity_point_lists(poly, 0.01)[0]
+    ref = [(v.x, v.y) for v in make_path(poly).flattening(0.01)]
+    assert len(fast) == len(ref)
+    for a, b in zip(fast, ref, strict=True):
+        assert a == pytest.approx(b)
+    assert fast[0] == pytest.approx(fast[-1]), "o contorno fechado tem de voltar ao inicio"
+
+
+def test_fast_flattening_defers_to_generic_when_not_trivial():
+    """Bulge e extrusao fora do plano tem de cair no caminho de referencia."""
+    doc = Document.new()
+    bulged = doc.msp.add_lwpolyline([(E, N, 0.0), (E + 10, N, 1.0)], format="xyb")
+    assert _fast_points(bulged, "LWPOLYLINE", 0.01) is None
+    tilted = doc.msp.add_line((E, N), (E + 1, N + 1), dxfattribs={"extrusion": (0, 0, -1)})
+    assert _fast_points(tilted, "LINE", 0.01) is None
+    # mas continuam produzindo geometria pelo caminho generico
+    assert entity_point_lists(bulged, 0.01)
+    assert entity_point_lists(tilted, 0.01)
+
+
+# ---------------- bbox rapido ----------------
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda m: m.add_line((E, N), (E - 7, N + 30)),
+        lambda m: m.add_circle((E + 5, N + 5), 2.5),
+        lambda m: m.add_arc((E, N), 10, 300, 60),
+        lambda m: m.add_arc((E, N), 10, 10, 80),
+        lambda m: m.add_lwpolyline([(E, N), (E + 10, N), (E + 10, N + 5)], close=True),
+        lambda m: m.add_point((E + 7, N + 8)),
+    ],
+)
+def test_fast_bbox_contains_the_generic_one(build):
+    doc = Document.new()
+    entity = build(doc.msp)
+    got = entity_bbox(entity)
+    ref = ezbbox.extents([entity], fast=False)
+    assert ref.has_data
+    assert got.minx <= ref.extmin.x + 1e-6
+    assert got.miny <= ref.extmin.y + 1e-6
+    assert got.maxx >= ref.extmax.x - 1e-6
+    assert got.maxy >= ref.extmax.y - 1e-6
+
+
+# ---------------- simplificacao por nivel ----------------
+
+
+def test_decimate_keeps_the_ends_and_collapses_straight_runs():
+    from engecad.core.geometry import decimate
+
+    reta = [(float(i), 0.0) for i in range(20)]
+    assert decimate(reta, 0.5) == [(0.0, 0.0), (19.0, 0.0)]
+
+    zigue = [(0.0, 0.0), (1.0, 0.05), (2.0, 0.0), (3.0, 5.0), (4.0, 0.0)]
+    got = decimate(zigue, 0.5)
+    assert got[0] == zigue[0] and got[-1] == zigue[-1]
+    assert (3.0, 5.0) in got, "o vertice que muda a forma tem de sobreviver"
+    assert (1.0, 0.05) not in got, "o desvio abaixo da tolerancia deve sumir"
+
+
+@pytest.mark.parametrize("tol", [0.05, 0.3, 2.0])
+def test_decimate_respects_the_tolerance(tol):
+    """Nenhum vertice descartado pode ficar alem da tolerancia da nova linha."""
+    from engecad.core.geometry import decimate, distance_to_segment
+
+    curva = [(i * 0.5, math.sin(i * 0.01) * 12.0 + math.sin(i * 0.31) * 0.4)
+             for i in range(400)]
+    simples = decimate(curva, tol)
+    assert 2 <= len(simples) <= len(curva)
+    for p in curva:
+        best = min(
+            distance_to_segment(Vec2(*p), Vec2(*a), Vec2(*b))
+            for a, b in zip(simples, simples[1:], strict=False)
+        )
+        assert best <= tol * 1.001
+
+
+def _bake_one(entity, doc, upw):
+    """Assa uma entidade sozinha na oitava correspondente a `upw` e devolve a celula."""
+    from engecad.render.displaylist import DisplayList, _Cell
+
+    doc.invalidate_all_geometry()  # a display list e consumidora unica das mudancas
+    display = DisplayList(doc)
+    display.sync()
+    level = int(math.floor(math.log2(upw)))
+    cell = _Cell()
+    i = display._slot[entity.dxf.get("handle")]
+    display._bake(
+        cell, entity, (2.0**level) * 0.4, 0.0, 0.0, 0, 7,
+        float(display._size[i]) / (2.0**level),
+    )
+    return cell
+
+
+def test_hatch_pattern_becomes_a_stain_when_it_is_small_on_screen():
+    doc = Document.new()
+    pts = [(E, N), (E + 20, N), (E + 20, N + 20), (E, N + 20)]
+    hatch = doc.msp.add_hatch()
+    hatch.set_pattern_fill("ANSI31", scale=0.25)
+    hatch.paths.add_polyline_path(pts, is_closed=True)
+    doc.rebuild_index()
+
+    perto = _bake_one(hatch, doc, 0.05)  # 20 m = 400 px
+    assert perto.strokes and not perto.fills, "de perto o padrao tem de aparecer"
+
+    longe = _bake_one(hatch, doc, 1.0)  # 20 m = 20 px
+    assert longe.fills and not longe.strokes, "de longe vira mancha"
+    assert longe.verts < perto.verts / 4
+
+
+def test_small_block_is_baked_as_a_mark_instead_of_the_symbol():
+    doc = Document.new()
+    blk = doc.drawing.blocks.new("SIMBOLO")
+    for k in range(12):
+        a = k * math.tau / 12
+        blk.add_line((0, 0), (math.cos(a), math.sin(a)))
+    blk.add_circle((0, 0), 1.0)
+    ref = doc.msp.add_blockref("SIMBOLO", (E, N))
+    doc.rebuild_index()
+
+    perto = _bake_one(ref, doc, 0.02)  # 2 m = 100 px
+    longe = _bake_one(ref, doc, 0.5)  # 2 m = 4 px
+    assert perto.verts > 30, "de perto o simbolo inteiro"
+    assert longe.verts <= 4, "de longe so a marca"
+
+
+def test_block_without_text_skips_the_label_pass():
+    from engecad.core.entities import insert_has_text
+
+    doc = Document.new()
+    simbolo = doc.drawing.blocks.new("SO_GEOMETRIA")
+    simbolo.add_circle((0, 0), 1.0)
+    com_texto = doc.drawing.blocks.new("COM_TEXTO")
+    com_texto.add_circle((0, 0), 1.0)
+    com_texto.add_text("NORTE", height=1.0)
+
+    assert not insert_has_text(doc.msp.add_blockref("SO_GEOMETRIA", (E, N)))
+    assert insert_has_text(doc.msp.add_blockref("COM_TEXTO", (E, N)))
+
+    aninhado = doc.drawing.blocks.new("ANINHADO")
+    aninhado.add_blockref("COM_TEXTO", (0, 0))
+    assert insert_has_text(doc.msp.add_blockref("ANINHADO", (E, N)))
+
+
+# ---------------- display list acompanha o documento ----------------
+
+
+def test_display_list_sees_new_entities(scene):
+    ctx, canvas = scene
+    before = _ink(canvas)
+    ctx.doc.add_line((E, N + 60), (E + 60, N + 60))
+    ctx.zoom_extents()
+    assert _ink(canvas) > before
+
+
+def test_display_list_sees_moved_entities(scene):
+    ctx, canvas = scene
+    circle = next(e for e in ctx.doc.msp if e.dxftype() == "CIRCLE")
+    before = _ink(canvas)
+    with ctx.doc.editing([circle], "mover"):
+        circle.dxf.center = (E + 60, N + 200)
+    assert _ink(canvas) != before
+
+
+def test_display_list_sees_deleted_entities(scene):
+    ctx, canvas = scene
+    before = _ink(canvas)
+    ctx.doc.delete([next(iter(ctx.doc.msp))])
+    assert _ink(canvas) < before
+
+
+def test_hidden_layer_disappears_from_the_scene(scene):
+    ctx, canvas = scene
+    before = _ink(canvas)
+    ctx.doc.set_layer_visible("MURO", False)
+    hidden = _ink(canvas)
+    assert hidden < before
+    ctx.doc.set_layer_visible("MURO", True)
+    assert _ink(canvas) == before
+
+
+def test_display_list_survives_an_empty_document():
+    """Um desenho que nasce vazio e cresce nao pode quebrar a grade de tiles."""
+    doc = Document.new()
+    ctx = AppContext(doc)
+    canvas = CadCanvas(ctx)
+    canvas.show_grid = False
+    canvas.resize(200, 150)
+    ctx.viewport.resize(200, 150)
+    assert _ink(canvas, 200, 150) == 0
+    for i in range(40):
+        doc.add_line((E + i, N), (E + i, N + 10))
+    ctx.zoom_extents()
+    assert _ink(canvas, 200, 150) > 0
+    canvas.deleteLater()
+
+
+# ---------------- cache de quadro ----------------
+
+
+def test_frame_cache_is_reused_and_covers_a_short_pan(scene):
+    ctx, canvas = scene
+    canvas.render(QImage(400, 300, QImage.Format_ARGB32_Premultiplied))
+    frame = canvas._frame
+    assert frame.is_exact(ctx.viewport)
+
+    spent = frame.last_ms
+    canvas.render(QImage(400, 300, QImage.Format_ARGB32_Premultiplied))
+    assert frame.last_ms == spent, "o quadro foi refeito mesmo com o cache valido"
+
+    ctx.viewport.pan_screen(20, 12)
+    assert frame.is_exact(ctx.viewport), "um pan curto deveria caber na folga"
+    ctx.viewport.pan_screen(5000, 0)
+    assert not frame.is_exact(ctx.viewport)
+
+
+def test_zoom_invalidates_the_frame_cache(scene):
+    ctx, canvas = scene
+    canvas.render(QImage(400, 300, QImage.Format_ARGB32_Premultiplied))
+    ctx.viewport.set_scale(ctx.viewport.scale * 2)
+    assert not canvas._frame.is_exact(ctx.viewport)
+
+
+# ---------------- desenho progressivo ----------------
+
+
+@pytest.fixture
+def crowded(qapp):
+    """Desenho grande o bastante para o quadro nao caber numa fatia so."""
+    doc = Document.new()
+    for i in range(6000):
+        x = E + (i % 100) * 3.0
+        y = N + (i // 100) * 3.0
+        doc.msp.add_lwpolyline([(x, y), (x + 2, y), (x + 2, y + 2), (x, y + 2)], close=True)
+    doc.rebuild_index()
+    ctx = AppContext(doc)
+    canvas = CadCanvas(ctx)
+    canvas.show_grid = False
+    canvas.resize(400, 300)
+    ctx.viewport.resize(400, 300)
+    ctx.zoom_extents()
+    yield ctx, canvas
+    canvas.deleteLater()
+
+
+def test_heavy_frame_is_drawn_in_slices(crowded):
+    """Cada fatia devolve o controle; o quadro so vale quando fecha."""
+    ctx, canvas = crowded
+    img = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    slices = 0
+    while not canvas._frame.complete:
+        assert not canvas._frame.is_exact(ctx.viewport), "quadro parcial nao pode valer"
+        canvas.render(img)
+        slices += 1
+        assert slices < 500, "o quadro nunca fechou"
+    assert slices > 1, "este desenho deveria precisar de mais de uma fatia"
+    assert canvas._frame.is_exact(ctx.viewport)
+
+
+def test_progressive_result_matches_the_direct_one(crowded):
+    """Fatiar muda quando o desenho aparece, nunca o que aparece."""
+    ctx, canvas = crowded
+    fatiado = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    while not canvas._frame.complete:
+        canvas.render(fatiado)
+
+    canvas.invalidate_scene()
+    canvas._display.clear()
+    canvas.render_scene_now()
+    assert canvas._frame.complete
+    direto = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    canvas.render(direto)
+    assert fatiado == direto
+
+
+def test_render_scene_now_needs_no_event_loop(crowded):
+    ctx, canvas = crowded
+    canvas.invalidate_scene()
+    canvas.render_scene_now()
+    assert canvas._frame.complete
+    assert canvas._frame.is_exact(ctx.viewport)
+
+
+def test_partial_rebuild_never_reaches_the_planner():
+    """Planejar com a display list pela metade descreveria o desenho errado."""
+    doc = Document.new()
+    for i in range(2000):
+        doc.msp.add_line((E + i, N), (E + i, N + 5))
+    doc.rebuild_index()
+    ctx = AppContext(doc)
+    display = ctx.canvas._display if ctx.canvas else None
+    if display is None:
+        canvas = CadCanvas(ctx)
+        display = canvas._display
+    # um prazo ja vencido: a preparacao tem de parar no meio e admitir isso
+    assert display.prepare(time.perf_counter() - 1.0) is False
+    assert len(display._slot) < 2000
+    while not display.prepare(None):
+        pass
+    assert len(display._slot) == 2000
+
+
+# ---------------- ponteiro ----------------
+
+
+def _move(canvas, x, y):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    canvas.mouseMoveEvent(
+        QMouseEvent(
+            QMouseEvent.MouseMove, QPointF(x, y), QPointF(x, y),
+            Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+        )
+    )
+
+
+def test_mouse_moves_are_coalesced(scene, monkeypatch):
+    """Uma rajada de eventos resolve o snap uma vez, nao uma vez por evento."""
+    ctx, canvas = scene
+    calls = []
+    real = ctx.snap.snap
+    monkeypatch.setattr(ctx.snap, "snap", lambda *a, **k: calls.append(1) or real(*a, **k))
+
+    for i in range(10):
+        _move(canvas, 100 + i, 100 + i)
+    assert calls == [], "o trabalho deveria estar adiado"
+    canvas._resolve_pointer()
+    assert len(calls) == 1
+    # e a posicao usada e a ultima da rajada
+    assert canvas._cursor_screen.x() == 109
+
+    # posicao repetida nao refaz trabalho nenhum
+    _move(canvas, 109, 109)
+    canvas._resolve_pointer()
+    assert len(calls) == 1
+
+    # mas mudar a vista sim: o raio de captura depende do zoom
+    ctx.viewport.set_scale(ctx.viewport.scale * 2)
+    canvas._emit_view_changed()
+    _move(canvas, 109, 109)
+    canvas._resolve_pointer()
+    assert len(calls) == 2
+
+
+def test_click_uses_a_fresh_snap(scene):
+    """Clicar antes de o trabalho adiado rodar nao pode usar o ponto antigo."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    ctx, canvas = scene
+    _move(canvas, 50, 50)
+    canvas._resolve_pointer()
+    first = canvas.effective_point()
+
+    _move(canvas, 300, 200)
+    assert canvas._pointer_dirty, "o movimento novo ainda nao foi resolvido"
+    canvas.mousePressEvent(
+        QMouseEvent(
+            QMouseEvent.MouseButtonPress, QPointF(300, 200), QPointF(300, 200),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+        )
+    )
+    assert not canvas._pointer_dirty
+    assert canvas.effective_point() != first
+
+
+def test_selection_shapes_are_cached_across_mouse_moves(scene):
+    ctx, canvas = scene
+    ctx.selection.set(list(ctx.doc.msp))
+    outlines, _ = canvas._selection_shapes()
+    assert outlines
+    again, _ = canvas._selection_shapes()
+    assert again is outlines, "o contorno foi refeito sem nada ter mudado"
+
+    ctx.selection.clear()
+    empty, _ = canvas._selection_shapes()
+    assert empty is not outlines and not empty
+
+    ctx.selection.set(list(ctx.doc.msp))
+    ctx.viewport.pan_screen(40, 0)
+    moved, _ = canvas._selection_shapes()
+    assert moved is not outlines, "mudar a vista tem de refazer o contorno"
+
+
+# ---------------- precisao do rebase ----------------
+
+
+def test_local_coordinates_stay_small_enough_for_the_rasterizer(scene):
+    """O motivo de existir da display list: numeros pequenos chegam ao Qt."""
+    ctx, canvas = scene
+    canvas.render(QImage(400, 300, QImage.Format_ARGB32_Premultiplied))
+    display = canvas._display
+    ox, oy = display._origin
+    assert abs(E - ox) < 1e4 and abs(N - oy) < 1e4
+    for cell in display._cells.values():
+        for path in cell.strokes.values():
+            box = path.boundingRect()
+            # em float32 um valor desta ordem tem erro submilimetrico
+            assert max(abs(box.left()), abs(box.top())) < 1e5
+
+
+# ---------------- snap sob orcamento ----------------
+
+
+def test_snap_still_finds_the_endpoint_under_the_candidate_budget():
+    """O teto de candidatos guarda os mais proximos, nunca os primeiros."""
+    doc = Document.new()
+    for i in range(400):  # ruido longe do cursor, dentro do raio de captura
+        doc.add_line((E + 200 + i, N + 200), (E + 210 + i, N + 200))
+    doc.add_line((E, N), (E + 5, N))
+    ctx = AppContext(doc)
+    ctx.viewport.resize(800, 600)
+    ctx.viewport.zoom_to_bbox(BBox(E - 400, N - 400, E + 800, N + 800))
+
+    result = ctx.snap.snap(Vec2(E + 0.2, N + 0.2), ctx.viewport)
+    assert result is not None
+    assert result.kind == "end"
+    assert result.point.distance_to(Vec2(E, N)) < 1e-9
+
+
+def test_pick_at_matches_an_exhaustive_scan():
+    """A saida antecipada por bbox nao pode mudar quem e a entidade mais proxima."""
+    from engecad.core.picking import entity_distance, pick_at
+
+    doc = Document.new()
+    random.seed(11)
+    for _ in range(600):
+        x = E + random.uniform(0, 60)
+        y = N + random.uniform(0, 40)
+        doc.msp.add_line((x, y), (x + random.uniform(-8, 8), y + random.uniform(-8, 8)))
+    doc.rebuild_index()
+
+    for _ in range(40):
+        p = Vec2(E + random.uniform(0, 60), N + random.uniform(0, 40))
+        tol = 1.5
+        got = pick_at(doc, p, tol)
+        best, best_d = None, float("inf")
+        for e in doc.query_point(p, tol):
+            d = entity_distance(e, p, tol * 0.1)
+            if d <= tol and d < best_d:
+                best, best_d = e, d
+        assert got is best
+
+
+def test_layer_state_cache_follows_visibility():
+    doc = Document.new()
+    doc.ensure_layer("MURO", 1)
+    assert doc.layer_is_visible("MURO")
+    doc.set_layer_visible("MURO", False)
+    assert not doc.layer_is_visible("MURO")
+    doc.set_layer_visible("MURO", True)
+    assert doc.layer_is_visible("MURO")
+    doc.set_layer_color("MURO", 5)
+    assert doc.layer_color("MURO") == 5
+
+
+def test_snap_point_cache_follows_edits():
+    doc = Document.new()
+    line = doc.add_line((E, N), (E + 10, N))
+    ctx = AppContext(doc)
+    ctx.viewport.resize(800, 600)
+    ctx.viewport.zoom_to_bbox(BBox(E - 20, N - 20, E + 30, N + 30))
+
+    assert ctx.snap.snap(Vec2(E + 10.05, N), ctx.viewport).point.distance_to(
+        Vec2(E + 10, N)
+    ) < 1e-9
+    with doc.editing([line], "mover"):
+        line.dxf.end = (E + 20, N)
+    hit = ctx.snap.snap(Vec2(E + 20.05, N), ctx.viewport)
+    assert hit is not None and hit.point.distance_to(Vec2(E + 20, N)) < 1e-9

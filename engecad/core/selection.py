@@ -19,6 +19,9 @@ class Selection:
         self.doc = doc
         self._items: list = []
         self.changed: list[Callable[[], None]] = []
+        #: Sobe a cada alteracao. Quem cacheia algo derivado da selecao (grips,
+        #: contornos) compara este numero em vez de recalcular por quadro.
+        self.revision = 0
 
     # ---------------- leitura ----------------
 
@@ -71,6 +74,7 @@ class Selection:
     # ---------------- escrita ----------------
 
     def _notify(self) -> None:
+        self.revision += 1
         for cb in self.changed:
             cb()
 

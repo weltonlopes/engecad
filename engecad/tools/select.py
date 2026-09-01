@@ -127,16 +127,30 @@ class SelectTool(Tool):
         self.hover = None
         self.hover_grip: Grip | None = None
         self._additive = False
+        self._grips: list[Grip] = []
+        self._grips_key: tuple | None = None
 
     # ---------------- grips ----------------
 
     def visible_grips(self) -> list[Grip]:
+        """Grips da selecao, com cache.
+
+        E consultado duas vezes por movimento do mouse -- para achar o grip sob o
+        cursor e para desenhar. Extrair os grips achata a geometria de cada
+        entidade selecionada; refazer isso a cada movimento pesava mais que o
+        teste de acerto.
+        """
         sel = self.ctx.selection
-        if len(sel) > MAX_GRIP_ENTITIES:
-            return []
+        key = (sel.revision, self.ctx.doc.geometry_revision)
+        if key == self._grips_key:
+            return self._grips
+        items = sel.items
         out: list[Grip] = []
-        for e in sel:
-            out.extend(entity_grips(e))
+        if len(items) <= MAX_GRIP_ENTITIES:
+            for e in items:
+                out.extend(entity_grips(e))
+        self._grips_key = key
+        self._grips = out
         return out
 
     # ---------------- entrada ----------------

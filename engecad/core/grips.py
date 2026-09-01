@@ -20,6 +20,7 @@ MOVE = "move"  # translada a entidade inteira
 VERTEX = "vertex"  # move um vertice/extremidade
 RADIUS = "radius"  # muda o raio
 ANGLE = "angle"  # muda um angulo de arco
+DIM_TEXT = "dim_text"  # move somente o texto da cota
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,39 @@ def entity_grips(entity) -> list[Grip]:
         p = entity_insert_point(entity)
         return [Grip(entity, p, MOVE, 0)] if p else []
 
+    if t == "DIMENSION":
+        kind = int(dxf.get("dimtype", 0) or 0) & 15
+        attrs = {
+            0: ("defpoint2", "defpoint3", "defpoint"),
+            1: ("defpoint2", "defpoint3", "defpoint"),
+            2: ("defpoint2", "defpoint3", "defpoint4", "defpoint"),
+            3: ("defpoint", "defpoint4"),
+            4: ("defpoint", "defpoint4"),
+            5: ("defpoint4", "defpoint2", "defpoint3", "defpoint"),
+            6: ("defpoint2", "defpoint3"),
+        }.get(kind, ())
+        grips = []
+        for i, attr in enumerate(attrs):
+            if dxf.hasattr(attr):
+                p = dxf.get(attr)
+                grips.append(Grip(entity, Vec2(p.x, p.y), VERTEX, i))
+        if dxf.hasattr("text_midpoint"):
+            p = dxf.text_midpoint
+            grips.append(Grip(entity, Vec2(p.x, p.y), DIM_TEXT, len(attrs)))
+        return grips
+
+    if t == "ARC_DIMENSION":
+        attrs = ("defpoint4", "defpoint2", "defpoint3", "defpoint")
+        grips = []
+        for i, attr in enumerate(attrs):
+            if dxf.hasattr(attr):
+                p = dxf.get(attr)
+                grips.append(Grip(entity, Vec2(p.x, p.y), VERTEX, i))
+        if dxf.hasattr("text_midpoint"):
+            p = dxf.text_midpoint
+            grips.append(Grip(entity, Vec2(p.x, p.y), DIM_TEXT, len(attrs)))
+        return grips
+
     return []
 
 
@@ -117,7 +151,6 @@ def drag_grip(entity, grip: Grip, target: Vec2) -> bool:
             pts[grip.index] = (target.x, target.y, old[2], old[3], old[4])
             entity.set_points(pts, format="xyseb")
             return True
-        return False
 
     if grip.kind == RADIUS and t in ("CIRCLE", "ARC"):
         c = Vec2(dxf.center.x, dxf.center.y)
@@ -138,6 +171,37 @@ def drag_grip(entity, grip: Grip, target: Vec2) -> bool:
         else:
             dxf.end_angle = ang
         return True
+
+    if t in ("DIMENSION", "ARC_DIMENSION"):
+        from .associative import detach_dimension_anchor
+        from .dimensions import rerender_dimension
+
+        if grip.kind == DIM_TEXT:
+            override = entity.override()
+            override.set_location((target.x, target.y, 0.0))
+            override.render()
+            return True
+        if grip.kind == VERTEX:
+            kind = int(dxf.get("dimtype", 0) or 0) & 15
+            if t == "ARC_DIMENSION":
+                attrs = ("defpoint4", "defpoint2", "defpoint3", "defpoint")
+            else:
+                attrs = {
+                    0: ("defpoint2", "defpoint3", "defpoint"),
+                    1: ("defpoint2", "defpoint3", "defpoint"),
+                    2: ("defpoint2", "defpoint3", "defpoint4", "defpoint"),
+                    3: ("defpoint", "defpoint4"),
+                    4: ("defpoint", "defpoint4"),
+                    5: ("defpoint4", "defpoint2", "defpoint3", "defpoint"),
+                    6: ("defpoint2", "defpoint3"),
+                }.get(kind, ())
+            if not 0 <= grip.index < len(attrs):
+                return False
+            attribute = attrs[grip.index]
+            detach_dimension_anchor(entity, attribute)
+            setattr(dxf, attribute, (target.x, target.y, 0.0))
+            rerender_dimension(entity)
+            return True
 
     return False
 
