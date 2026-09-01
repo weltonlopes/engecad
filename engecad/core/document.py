@@ -7,6 +7,7 @@ espacial) esta empilhado aqui por cima.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +16,15 @@ import ezdxf
 from ezdxf.document import Drawing
 
 from .crs import ProjectCRS
+from .dimensions import (
+    DIMENSION_TYPES,
+    DIMSTYLE_NAME,
+    DimensionStyleSettings,
+    apply_dimension_style,
+    ensure_dimension_style,
+    read_dimension_style,
+    rerender_dimension,
+)
 from .entities import entity_bbox
 from .geometry import BBox, Vec2
 from .snapshot import restore, snapshot
@@ -159,6 +169,7 @@ class Document:
         drawing.header["$MEASUREMENT"] = 1
         doc = cls(drawing, crs if isinstance(crs, ProjectCRS) else ProjectCRS(crs))
         doc.setup_default_layers()
+        ensure_dimension_style(drawing, DIMSTYLE_NAME)
         doc._modified = False
         return doc
 
@@ -171,6 +182,30 @@ class Document:
     def setup_default_layers(self) -> None:
         for name, color in DEFAULT_LAYERS:
             self.ensure_layer(name, color)
+
+    @property
+    def dimension_style_name(self) -> str:
+        return DIMSTYLE_NAME
+
+    def dimension_style(self):
+        return ensure_dimension_style(self.drawing, self.dimension_style_name)
+
+    def dimension_style_settings(self) -> DimensionStyleSettings:
+        if self.dimension_style_name not in self.drawing.dimstyles:
+            return DimensionStyleSettings()
+        return read_dimension_style(self.drawing.dimstyles.get(self.dimension_style_name))
+
+    def update_dimension_style(self, settings: DimensionStyleSettings) -> None:
+        """Atualiza o estilo corrente e todas as suas representacoes graficas."""
+        apply_dimension_style(self.dimension_style(), settings)
+        for entity in self.msp:
+            if (
+                entity.dxftype() in DIMENSION_TYPES
+                and entity.dxf.get("dimstyle", "") == self.dimension_style_name
+            ):
+                rerender_dimension(entity)
+                self._index_update(entity)
+        self._touch()
 
     # ---------------- estado ----------------
 
@@ -356,6 +391,127 @@ class Document:
             dxfattribs=self._attribs(layer, kw),
         )
         return self._register_new(e, "arco")
+
+    def _add_dimension(self, override, name: str):
+        override.render()
+        return self._register_new(override.dimension, name)
+
+    def _dim_attribs(self, layer: str | None, extra: dict | None = None) -> dict:
+        return self._attribs(layer or "COTA", extra)
+
+    def add_linear_dimension(
+        self, p1, p2, base, angle: float = 0.0, *, text: str = "<>",
+        layer: str | None = None, style: str | None = None, override: dict | None = None,
+    ):
+        p1, p2, base = Vec2.of(p1), Vec2.of(p2), Vec2.of(base)
+        dimstyle = style or self.dimension_style_name
+        ensure_dimension_style(self.drawing, dimstyle)
+        obj = self.msp.add_linear_dim(
+            base=(base.x, base.y), p1=(p1.x, p1.y), p2=(p2.x, p2.y),
+            angle=float(angle), text=text, dimstyle=dimstyle, override=override,
+            dxfattribs=self._dim_attribs(layer),
+        )
+        return self._add_dimension(obj, "cota linear")
+
+    def add_aligned_dimension(
+        self, p1, p2, base, *, text: str = "<>", layer: str | None = None,
+        style: str | None = None, override: dict | None = None,
+    ):
+        p1, p2, base = Vec2.of(p1), Vec2.of(p2), Vec2.of(base)
+        edge = p2 - p1
+        if edge.length <= 1e-9:
+            raise ValueError("pontos de medicao coincidentes")
+        distance = edge.cross(base - p1) / edge.length
+        dimstyle = style or self.dimension_style_name
+        ensure_dimension_style(self.drawing, dimstyle)
+        obj = self.msp.add_aligned_dim(
+            p1=(p1.x, p1.y), p2=(p2.x, p2.y), distance=distance,
+            text=text, dimstyle=dimstyle, override=override,
+            dxfattribs=self._dim_attribs(layer),
+        )
+        return self._add_dimension(obj, "cota alinhada")
+
+    def add_angular_dimension(
+        self, center, p1, p2, base, *, text: str = "<>", layer: str | None = None,
+        style: str | None = None, override: dict | None = None,
+    ):
+        center, p1, p2, base = map(Vec2.of, (center, p1, p2, base))
+        dimstyle = style or self.dimension_style_name
+        ensure_dimension_style(self.drawing, dimstyle)
+        obj = self.msp.add_angular_dim_3p(
+            base=(base.x, base.y), center=(center.x, center.y),
+            p1=(p1.x, p1.y), p2=(p2.x, p2.y), text=text,
+            dimstyle=dimstyle, override=override, dxfattribs=self._dim_attribs(layer),
+        )
+        return self._add_dimension(obj, "cota angular")
+
+    def add_radius_dimension(
+        self, center, radius: float, placement, *, text: str = "<>",
+        layer: str | None = None, style: str | None = None, override: dict | None = None,
+    ):
+        center, placement = Vec2.of(center), Vec2.of(placement)
+        if radius <= 1e-9:
+            raise ValueError("raio invalido")
+        direction = placement - center
+        angle = 0.0 if direction.length <= 1e-9 else math.degrees(direction.angle)
+        dimstyle = style or self.dimension_style_name
+        ensure_dimension_style(self.drawing, dimstyle)
+        obj = self.msp.add_radius_dim(
+            center=(center.x, center.y), radius=float(radius), angle=angle,
+            location=(placement.x, placement.y), text=text, dimstyle=dimstyle,
+            override=override, dxfattribs=self._dim_attribs(layer),
+        )
+        return self._add_dimension(obj, "cota de raio")
+
+    def add_diameter_dimension(
+        self, center, radius: float, placement, *, text: str = "<>",
+        layer: str | None = None, style: str | None = None, override: dict | None = None,
+    ):
+        center, placement = Vec2.of(center), Vec2.of(placement)
+        if radius <= 1e-9:
+            raise ValueError("raio invalido")
+        direction = placement - center
+        angle = 0.0 if direction.length <= 1e-9 else math.degrees(direction.angle)
+        dimstyle = style or self.dimension_style_name
+        ensure_dimension_style(self.drawing, dimstyle)
+        obj = self.msp.add_diameter_dim(
+            center=(center.x, center.y), radius=float(radius), angle=angle,
+            location=(placement.x, placement.y), text=text, dimstyle=dimstyle,
+            override=override, dxfattribs=self._dim_attribs(layer),
+        )
+        return self._add_dimension(obj, "cota de diametro")
+
+    def add_ordinate_dimension(
+        self, feature, leader_end, *, x_type: bool | None = None, origin=(0, 0),
+        text: str = "<>", layer: str | None = None, style: str | None = None,
+        override: dict | None = None,
+    ):
+        feature, leader_end, origin = Vec2.of(feature), Vec2.of(leader_end), Vec2.of(origin)
+        offset = leader_end - feature
+        if x_type is None:
+            x_type = abs(offset.y) >= abs(offset.x)
+        dimstyle = style or self.dimension_style_name
+        ensure_dimension_style(self.drawing, dimstyle)
+        obj = self.msp.add_ordinate_dim(
+            feature_location=(feature.x, feature.y), offset=(offset.x, offset.y),
+            dtype=1 if x_type else 0, origin=(origin.x, origin.y), text=text,
+            dimstyle=dimstyle, override=override, dxfattribs=self._dim_attribs(layer),
+        )
+        return self._add_dimension(obj, "cota ordenada")
+
+    def add_arc_length_dimension(
+        self, center, p1, p2, base, *, text: str = "<>", layer: str | None = None,
+        style: str | None = None, override: dict | None = None,
+    ):
+        center, p1, p2, base = map(Vec2.of, (center, p1, p2, base))
+        dimstyle = style or self.dimension_style_name
+        ensure_dimension_style(self.drawing, dimstyle)
+        obj = self.msp.add_arc_dim_3p(
+            base=(base.x, base.y), center=(center.x, center.y),
+            p1=(p1.x, p1.y), p2=(p2.x, p2.y), text=text,
+            dimstyle=dimstyle, override=override, dxfattribs=self._dim_attribs(layer),
+        )
+        return self._add_dimension(obj, "comprimento de arco")
 
     # ---------------- edicao ----------------
 

@@ -13,6 +13,7 @@ import math
 from ezdxf import bbox as ezbbox
 from ezdxf.path import make_path
 
+from .dimensions import DIMENSION_TYPES, dimension_primitives
 from .geometry import BBox, Vec2
 
 # Entidades que viram texto/marcador em vez de polilinha.
@@ -27,6 +28,12 @@ def entity_polylines(entity, sagitta: float = 0.01) -> list[list[Vec2]]:
     qualquer zoom sem gerar vertices demais quando esta longe.
     """
     dxftype = entity.dxftype()
+    if dxftype in DIMENSION_TYPES:
+        out: list[list[Vec2]] = []
+        for primitive in dimension_primitives(entity):
+            if primitive.dxftype() not in POINT_LIKE:
+                out.extend(entity_polylines(primitive, sagitta))
+        return out
     if dxftype in POINT_LIKE:
         return []
     try:
@@ -68,6 +75,16 @@ def entity_snap_points(entity) -> list[tuple[str, Vec2]]:
     t = entity.dxftype()
     dxf = entity.dxf
     out: list[tuple[str, Vec2]] = []
+
+    if t in DIMENSION_TYPES:
+        for attr in ("defpoint", "defpoint2", "defpoint3", "defpoint4", "defpoint5"):
+            if dxf.hasattr(attr):
+                p = dxf.get(attr)
+                out.append(("end", Vec2(p.x, p.y)))
+        if dxf.hasattr("text_midpoint"):
+            p = dxf.text_midpoint
+            out.append(("mid", Vec2(p.x, p.y)))
+        return out
 
     if t == "LINE":
         a, b = Vec2(dxf.start.x, dxf.start.y), Vec2(dxf.end.x, dxf.end.y)

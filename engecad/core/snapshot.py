@@ -25,6 +25,8 @@ SUPPORTED = {
     "TEXT",
     "MTEXT",
     "INSERT",
+    "DIMENSION",
+    "ARC_DIMENSION",
 }
 
 
@@ -109,6 +111,26 @@ def snapshot(entity) -> dict | None:
             "yscale": float(dxf.get("yscale", 1.0)),
         }
 
+    if t in ("DIMENSION", "ARC_DIMENSION"):
+        snap = {"_t": t}
+        for attr in (
+            "defpoint", "defpoint2", "defpoint3", "defpoint4", "defpoint5",
+            "text_midpoint", "insert", "leader_point1", "leader_point2",
+        ):
+            if dxf.hasattr(attr):
+                snap[attr] = _xy(dxf.get(attr))
+        for attr in (
+            "angle", "oblique_angle", "horizontal_direction", "start_angle", "end_angle"
+        ):
+            if dxf.hasattr(attr):
+                snap[attr] = float(dxf.get(attr))
+        for attr in ("is_partial", "has_leader"):
+            if dxf.hasattr(attr):
+                snap[attr] = int(dxf.get(attr))
+        snap["dimtype"] = int(dxf.get("dimtype", 0) or 0)
+        snap["text"] = str(dxf.get("text", "<>"))
+        return snap
+
     return None
 
 
@@ -175,6 +197,15 @@ def restore(entity, snap: dict | None) -> bool:
         dxf.rotation = snap["rotation"]
         dxf.xscale = snap["xscale"]
         dxf.yscale = snap["yscale"]
+        return True
+
+    if t in ("DIMENSION", "ARC_DIMENSION"):
+        from .dimensions import rerender_dimension
+
+        for attr, value in snap.items():
+            if attr != "_t":
+                setattr(dxf, attr, value)
+        rerender_dimension(entity)
         return True
 
     return False

@@ -12,6 +12,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
+from ..core.dimensions import DIMENSION_TYPES, dimension_primitives
 from ..core.entities import POINT_LIKE, entity_insert_point, entity_polylines
 from ..core.geometry import Vec2
 from .styles import DARK, aci_to_qcolor
@@ -259,6 +260,9 @@ class CadCanvas(QWidget):
             painter.setPen(pen)
 
             t = e.dxftype()
+            if t in DIMENSION_TYPES:
+                self._paint_dimension(painter, e, tol, font)
+                continue
             if t in POINT_LIKE:
                 self._paint_point_like(painter, e, t, font)
                 continue
@@ -278,7 +282,8 @@ class CadCanvas(QWidget):
             painter.drawLine(QPointF(sx, sy - 4), QPointF(sx, sy + 4))
             return
         if dxftype in ("TEXT", "MTEXT"):
-            height = float(e.dxf.get("height", 1.0) or 1.0)
+            attr = "height" if dxftype == "TEXT" else "char_height"
+            height = float(e.dxf.get(attr, 1.0) or 1.0)
             px = vp.world_to_px(height)
             if px < 3:  # ilegivel: vira um tracinho
                 painter.drawLine(QPointF(sx, sy), QPointF(sx + 6, sy))
@@ -286,10 +291,68 @@ class CadCanvas(QWidget):
             font.setPixelSize(max(3, int(px)))
             painter.setFont(font)
             text = e.dxf.get("text", "") if dxftype == "TEXT" else e.text
-            painter.drawText(QPointF(sx, sy), str(text))
+            rotation = float(e.dxf.get("rotation", 0.0) or 0.0)
+            if abs(rotation) > 1e-9:
+                painter.save()
+                painter.translate(sx, sy)
+                painter.rotate(-rotation)
+                painter.drawText(QPointF(0, 0), str(text))
+                painter.restore()
+            else:
+                painter.drawText(QPointF(sx, sy), str(text))
             return
         # INSERT e outros: marcador simples
         painter.drawRect(QRectF(sx - 3, sy - 3, 6, 6))
+
+    def _paint_dimension(self, painter, entity, tol, font):
+        """Desenha o bloco anonimo nativo da entidade DIMENSION."""
+        vp = self.vp
+        for primitive in dimension_primitives(entity):
+            t = primitive.dxftype()
+            if t == "POINT":  # pontos Defpoints nao fazem parte da impressao
+                continue
+            if t in ("TEXT", "MTEXT"):
+                p = entity_insert_point(primitive)
+                if p is None:
+                    continue
+                sx, sy = vp.world_to_screen(p)
+                attr = "height" if t == "TEXT" else "char_height"
+                height = float(primitive.dxf.get(attr, 0.25) or 0.25)
+                px = vp.world_to_px(height)
+                if px < 3:
+                    painter.drawLine(QPointF(sx - 3, sy), QPointF(sx + 3, sy))
+                    continue
+                font.setPixelSize(max(3, int(px)))
+                painter.setFont(font)
+                if t == "MTEXT":
+                    try:
+                        text = primitive.plain_text()
+                    except AttributeError:
+                        text = primitive.text
+                else:
+                    text = primitive.dxf.get("text", "")
+                rotation = float(primitive.dxf.get("rotation", 0.0) or 0.0)
+                painter.save()
+                painter.translate(sx, sy)
+                painter.rotate(-rotation)
+                # As cotas do ezdxf usam ponto de anexacao central para o MTEXT.
+                half_width = max(30.0, len(str(text)) * px)
+                rect = QRectF(-half_width, -px, half_width * 2, px * 2)
+                painter.drawText(rect, Qt.AlignCenter, str(text))
+                painter.restore()
+                continue
+            polys = entity_polylines(primitive, tol)
+            for poly in polys:
+                pts = QPolygonF([QPointF(*vp.world_to_screen(p)) for p in poly])
+                if len(pts) < 2:
+                    continue
+                if t in ("SOLID", "TRACE", "3DFACE"):
+                    painter.save()
+                    painter.setBrush(QBrush(painter.pen().color()))
+                    painter.drawPolygon(pts)
+                    painter.restore()
+                else:
+                    painter.drawPolyline(pts)
 
     def _entity_outline(self, painter, entity, tol):
         """Traca o contorno da entidade com a caneta ja escolhida."""

@@ -7,6 +7,15 @@ acionadores: linha de comando, console Python (api.command) e AutoLISP (v0.4).
 from __future__ import annotations
 
 from .core.coordinput import parse_coordinate
+from .tools.dimension import (
+    AlignedDimensionTool,
+    AngularDimensionTool,
+    ArcLengthDimensionTool,
+    DiameterDimensionTool,
+    LinearDimensionTool,
+    OrdinateDimensionTool,
+    RadiusDimensionTool,
+)
 from .tools.draw import LineTool, PolylineTool
 from .tools.measure import AreaTool, DistanceTool
 from .tools.modify import (
@@ -45,6 +54,52 @@ def register_builtin_commands(reg) -> None:
     reg.register(
         "TEXT", lambda ctx, *a: TextTool(ctx), ("T", "TEXTO"),
         "Insere um texto", "desenho",
+    )
+
+    # ---- cotas DXF nativas ----
+    reg.register(
+        "DIMLINEAR", lambda ctx, *a: LinearDimensionTool(ctx), ("DLI", "COTALINEAR"),
+        "Cota linear horizontal/vertical automatica", "cotas",
+    )
+    reg.register(
+        "DIMALIGNED", lambda ctx, *a: AlignedDimensionTool(ctx),
+        ("DAL", "DIM", "COTAALINHADA"), "Cota alinhada a dois pontos", "cotas",
+    )
+    reg.register(
+        "DIMROTATED", lambda ctx, *a: LinearDimensionTool(ctx, ask_angle=True),
+        ("DRO", "COTAROTACIONADA"), "Cota linear em angulo informado", "cotas",
+    )
+    reg.register(
+        "DIMHORIZONTAL", lambda ctx, *a: LinearDimensionTool(ctx, angle=0.0),
+        ("DHO",), "Cota linear horizontal", "cotas",
+    )
+    reg.register(
+        "DIMVERTICAL", lambda ctx, *a: LinearDimensionTool(ctx, angle=90.0),
+        ("DVE",), "Cota linear vertical", "cotas",
+    )
+    reg.register(
+        "DIMANGULAR", lambda ctx, *a: AngularDimensionTool(ctx), ("DAN", "COTAANGULAR"),
+        "Cota angular por vertice e lados", "cotas",
+    )
+    reg.register(
+        "DIMRADIUS", lambda ctx, *a: RadiusDimensionTool(ctx), ("DRA", "COTARAIO"),
+        "Cota o raio de circulo ou arco", "cotas",
+    )
+    reg.register(
+        "DIMDIAMETER", lambda ctx, *a: DiameterDimensionTool(ctx), ("DDI", "COTADIAMETRO"),
+        "Cota o diametro de circulo ou arco", "cotas",
+    )
+    reg.register(
+        "DIMARC", lambda ctx, *a: ArcLengthDimensionTool(ctx), ("DAR", "COTAARCO"),
+        "Cota o comprimento de um arco", "cotas",
+    )
+    reg.register(
+        "DIMORDINATE", lambda ctx, *a: OrdinateDimensionTool(ctx), ("DOR", "COTAORDENADA"),
+        "Cota ordenada X ou Y", "cotas",
+    )
+    reg.register(
+        "DIMSTYLE", _dimension_style, ("D", "COTAESTILO"),
+        "Consulta/altera o estilo de cotas", "cotas", False,
     )
 
     # ---- modificar ----
@@ -240,3 +295,61 @@ def _help(ctx, *args):
         lines.append(f"[{cat}]")
         lines.extend(sorted(by_cat[cat]))
     ctx.message("\n".join(lines))
+
+
+def _dimension_style(ctx, *args):
+    """DIMSTYLE sem argumentos consulta; com chave=valor altera o estilo."""
+    from dataclasses import replace
+
+    settings = ctx.doc.dimension_style_settings()
+    if not args:
+        ctx.message(
+            f"Estilo {ctx.doc.dimension_style_name}: texto={settings.text_height:g}, "
+            f"seta={settings.arrow_size:g}, escala={settings.scale:g}, "
+            f"precisao={settings.precision}, angular={settings.angular_precision}, "
+            f"separador={settings.decimal_separator}, prefixo={settings.prefix!r}, "
+            f"sufixo={settings.suffix!r}"
+        )
+        return
+
+    aliases = {
+        "texto": "text_height", "text": "text_height", "altura": "text_height",
+        "seta": "arrow_size", "arrow": "arrow_size",
+        "escala": "scale", "scale": "scale",
+        "afastamento": "extension_offset", "offset": "extension_offset",
+        "extensao": "extension_beyond", "extension": "extension_beyond",
+        "gap": "text_gap", "folga": "text_gap",
+        "precisao": "precision", "precision": "precision",
+        "angular": "angular_precision",
+        "separador": "decimal_separator", "separator": "decimal_separator",
+        "zeros": "suppress_trailing_zeros",
+        "prefixo": "prefix", "prefix": "prefix",
+        "sufixo": "suffix", "suffix": "suffix",
+    }
+    changes = {}
+    tokens = " ".join(str(a) for a in args).split()
+    for token in tokens:
+        if "=" not in token:
+            ctx.message(f"Opcao invalida: {token}. Use chave=valor")
+            return
+        raw_key, raw_value = token.split("=", 1)
+        key = aliases.get(raw_key.strip().lower())
+        if key is None:
+            ctx.message(f"Opcao de estilo desconhecida: {raw_key}")
+            return
+        value = raw_value.strip().strip('"')
+        try:
+            if key in ("precision", "angular_precision"):
+                changes[key] = int(value)
+            elif key == "suppress_trailing_zeros":
+                changes[key] = value.lower() not in ("0", "nao", "não", "false", "off")
+            elif key in ("decimal_separator", "prefix", "suffix"):
+                changes[key] = value
+            else:
+                changes[key] = float(value.replace(",", "."))
+        except ValueError:
+            ctx.message(f"Valor invalido para {raw_key}: {raw_value}")
+            return
+    updated = replace(settings, **changes)
+    ctx.doc.update_dimension_style(updated)
+    ctx.message(f"Estilo de cotas {ctx.doc.dimension_style_name} atualizado")

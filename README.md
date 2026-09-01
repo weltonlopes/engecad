@@ -40,6 +40,7 @@ python -m engecad planta.dxf     # abre um desenho direto
 | **Coordenadas** | CRS via PROJ/pyproj, SIRGAS 2000 / UTM pré-configurado, E/N ao vivo na barra de status |
 | **Imagem de fundo** | GeoTIFF/COG, JP2, ECW (ver abaixo), reprojeção on-the-fly, leitura decimada por overviews |
 | **Desenho** | linha, polilinha, retângulo, círculo, arco por 3 pontos, texto |
+| **Cotas DXF** | linear, alinhada, rotacionada, angular, raio, diâmetro, arco e ordenada; DIMSTYLE métrico |
 | **Seleção** | clique, janela (→) e captura (←), Shift para somar/tirar, realce ao passar o cursor |
 | **Grips** | esticar vértice, mover entidade, mudar raio e ângulo — arrastando, sem comando |
 | **Edição** | mover, copiar, girar, espelhar, escalar, paralela, aparar, estender, apagar |
@@ -77,6 +78,13 @@ embaixo antes de cada comando.
 | `CIRCLE` `C` | `MIRROR` `MI` | `PAN` `P` |
 | `ARC` `A` | `SCALE` `SC` | `GRADE` `F7` |
 | `TEXT` `T` | `OFFSET` `O` | `OSNAP` `F3` |
+| `DIMLINEAR` `DLI` | | |
+| `DIMALIGNED` `DAL` | | |
+| `DIMANGULAR` `DAN` | | |
+| `DIMRADIUS` `DRA` | | |
+| `DIMDIAMETER` `DDI` | | |
+| `DIMARC` `DAR` | | |
+| `DIMORDINATE` `DOR` | | |
 | | `TRIM` `TR` | `CAMADA` `LA` |
 | | `EXTEND` `EX` | `U` / `REDO` |
 | | `ERASE` `E` / `Del` | `AJUDA` `F1` |
@@ -129,6 +137,10 @@ copy(e, 12, 0)                # devolve as cópias
 rotate(e, (0,0), 90)          # graus, anti-horário
 scale(e, (0,0), 2.0)
 offset(e, 3.0)                # paralela; >0 = à esquerda do trajeto
+
+add_linear_dimension((0,0), (10,0), (0,2))
+add_aligned_dimension((0,0), (10,5), (5,8))
+add_radius_dimension((20,0), 5, (27,2))
 
 select_all(); selected(); deselect()
 area([(0,0), (10,0), (10,10), (0,10)])       # 100.0
@@ -197,7 +209,7 @@ testáveis sem abrir janela.
 pytest -q
 ```
 
-218 testes. Os que mais importam:
+227 testes. Os que mais importam:
 
 - ida e volta `mundo → tela → mundo` com coordenada UTM real (exigido < 1 mm; medido: 0);
 - zoom ancorado 60× sem deriva do ponto sob o cursor;
@@ -221,7 +233,7 @@ pintados.
 |---|---|
 | 0.1 | ver, desenhar, salvar, console Python |
 | **0.2** | *(atual)* seleção, grips, edição completa, arco/círculo/retângulo/texto |
-| 0.3 | plantas cadastrais: hachura, cotas, blocos, quadro de áreas, memorial descritivo |
+| 0.3 | plantas cadastrais: hachura, blocos, quadro de áreas, memorial descritivo |
 | 0.4 | **AutoLISP**: interpretador próprio + `command`, `entmake`, `ssget`, carga de `.lsp` |
 | 0.5 | espaço papel, escala de plotagem, carimbo, PDF georreferenciado |
 | 0.6 | SHP / GeoPackage / KML, tiles XYZ e WMS |

@@ -99,6 +99,9 @@ class PointCollectorTool(Tool):
         self.points: list[Vec2] = []
         self.cursor: Vec2 | None = None
 
+    def activate(self) -> None:
+        self.update_prompt()
+
     # -- pontos --
 
     def add_point(self, p: Vec2) -> None:
