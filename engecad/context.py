@@ -25,6 +25,7 @@ class AppContext(QObject):
     toolChanged = Signal(object)
     viewChanged = Signal()
     rastersChanged = Signal()
+    layerManagerRequested = Signal()
 
     def __init__(self, doc: Document | None = None):
         super().__init__()

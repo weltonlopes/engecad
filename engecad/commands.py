@@ -358,12 +358,52 @@ def _redo(ctx, *args):
 
 def _set_layer(ctx, *args):
     if not args:
+        ctx.layerManagerRequested.emit()
         ctx.message(f"Camada corrente: {ctx.doc.current_layer}")
         return
-    name = str(args[0]).strip()
-    ctx.doc.current_layer = name
+    manager = ctx.doc.layer_manager
+    tokens = [str(arg).strip() for arg in args if str(arg).strip()]
+    operation = tokens[0].upper()
+    try:
+        if operation in {"NEW", "NOVA", "NOVO"} and len(tokens) > 1:
+            manager.create(" ".join(tokens[1:]))
+            ctx.message(f"Camada criada: {' '.join(tokens[1:])}")
+        elif operation in {"DELETE", "EXCLUIR", "APAGAR"} and len(tokens) > 1:
+            manager.delete(" ".join(tokens[1:]))
+            ctx.message(f"Camada excluida: {' '.join(tokens[1:])}")
+        elif operation in {"RENAME", "RENOMEAR"} and len(tokens) > 2:
+            manager.rename(tokens[1], " ".join(tokens[2:]))
+            ctx.message(f"Camada renomeada: {tokens[1]} -> {' '.join(tokens[2:])}")
+        elif operation in {"ON", "LIGAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), on=True)
+        elif operation in {"OFF", "DESLIGAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), on=False)
+        elif operation in {"FREEZE", "CONGELAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), frozen=True)
+        elif operation in {"THAW", "DESCONGELAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), frozen=False)
+        elif operation in {"LOCK", "BLOQUEAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), locked=True)
+        elif operation in {"UNLOCK", "DESBLOQUEAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), locked=False)
+        elif operation in {"STATE", "ESTADO"} and len(tokens) > 2:
+            action, state_name = tokens[1].upper(), " ".join(tokens[2:])
+            if action in {"SAVE", "SALVAR"}:
+                manager.save_state(state_name)
+                ctx.message(f"Estado salvo: {state_name}")
+            elif action in {"RESTORE", "RESTAURAR"}:
+                manager.restore_state(state_name)
+                ctx.message(f"Estado restaurado: {state_name}")
+            else:
+                raise ValueError("Use CAMADA ESTADO SALVAR|RESTAURAR <nome>")
+        else:
+            name = " ".join(tokens[1:] if operation in {"SET", "ATUAL"} else tokens)
+            manager.set_current(name)
+            ctx.message(f"Camada corrente: {name}")
+    except Exception as exc:
+        ctx.message(f"Camada: {exc}")
+        return
     ctx.documentChanged.emit()
-    ctx.message(f"Camada corrente: {name}")
 
 
 def _toggle_osnap(ctx, *args):

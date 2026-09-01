@@ -47,6 +47,7 @@ def save_sidecar(ctx, dxf_path: str | Path) -> Path:
         "current_layer": ctx.doc.current_layer,
         "annotation_scale": ctx.doc.annotation_scale,
         "project_attributes": dict(ctx.doc.project_attributes),
+        "layers": ctx.doc.layer_manager.export_metadata(),
         "view": {"center": [vp.center.x, vp.center.y], "scale": vp.scale},
         "rasters": [
             {
@@ -96,6 +97,7 @@ def load_sidecar(ctx, dxf_path: str | Path) -> dict | None:
             {str(key): str(value) for key, value in attributes.items()}
         )
     ctx.doc.project_attributes["CRS"] = ctx.doc.crs.display
+    ctx.doc.layer_manager.import_metadata(data.get("layers"))
 
     from ..render.raster_layer import RasterLayer
 

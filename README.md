@@ -36,6 +36,7 @@ python -m engecad planta.dxf     # abre um desenho direto
 
 | | |
 |---|---|
+| **Interface** | Ribbon escura em 5 guias, com todos os comandos, ícones vetoriais, acesso rápido e modo compacto (`Ctrl+F1`) |
 | **Vista** | pan (botão do meio), zoom ancorado no cursor, grade adaptativa, escala 1:N |
 | **Coordenadas** | CRS via PROJ/pyproj, SIRGAS 2000 / UTM pré-configurado, E/N ao vivo na barra de status |
 | **Imagem de fundo** | GeoTIFF/COG, JP2, ECW (ver abaixo), reprojeção on-the-fly, leitura decimada por overviews |
@@ -71,6 +72,10 @@ O `<<` para azimute é a forma direta de lançar um memorial descritivo.
 
 Digitar com o foco no desenho já cai na linha de comando — não precisa clicar lá
 embaixo antes de cada comando.
+
+A Ribbon organiza as ferramentas em **Início**, **Inserir**, **Anotar**, **Vista**
+e **Gerenciar**. Dê dois cliques numa guia ou use `Ctrl+F1` para recolhê-la e
+ganhar área de desenho; os atalhos e os comandos digitados continuam os mesmos.
 
 ### Comandos
 
