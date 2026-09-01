@@ -20,6 +20,10 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..context import AppContext
+from ..io.dwg_io import DwgError
+from ..io.dwg_io import diagnose as diagnose_dwg
+from ..io.dwg_io import export_document as export_dwg_document
+from ..io.dwg_io import open_document as open_dwg_document
 from ..io.dxf_io import DxfError, new_document, open_document, save_document
 from ..io.raster_import import (
     RasterImportError,
@@ -42,6 +46,7 @@ RASTER_FILTER = (
     "ECW (*.ecw);;GeoTIFF/COG (*.tif *.tiff);;Todos (*)"
 )
 DXF_FILTER = "Desenho DXF (*.dxf);;Todos (*)"
+DWG_FILTER = "Desenho DWG (*.dwg);;Todos (*)"
 SHAPEFILE_FILTER = "Shapefile (*.shp);;Todos (*)"
 
 
@@ -148,8 +153,10 @@ class MainWindow(QMainWindow):
         m_file = self.menuBar().addMenu("&Arquivo")
         m_file.addAction(self._act("&Novo...", self.on_new, "Ctrl+N"))
         m_file.addAction(self._act("&Abrir DXF...", self.on_open, "Ctrl+O"))
+        m_file.addAction(self._act("Abrir DW&G...", self.on_open_dwg))
         m_file.addAction(self._act("&Salvar", self.on_save, "Ctrl+S"))
         m_file.addAction(self._act("Salvar &como...", self.on_save_as, "Ctrl+Shift+S"))
+        m_file.addAction(self._act("Exportar &DWG...", self.on_export_dwg))
         m_file.addSeparator()
         m_file.addAction(
             self._act("&Importar imagem de fundo...", self.on_import_raster, "Ctrl+I")
@@ -254,6 +261,7 @@ class MainWindow(QMainWindow):
         m_help = self.menuBar().addMenu("A&juda")
         m_help.addAction(self._act("Lista de &comandos", lambda: self.run("AJUDA"), "F1"))
         m_help.addAction(self._act("Diagnostico de &raster (ECW)...", self.on_diagnose))
+        m_help.addAction(self._act("Diagnostico de D&WG...", self.on_diagnose_dwg))
         m_help.addAction(self._act("&Sobre o EngeCAD", self.on_about))
 
     def _connect(self) -> None:
@@ -361,6 +369,19 @@ class MainWindow(QMainWindow):
             return
         self.ctx.message(f"Aberto: {Path(path).name}")
 
+    def on_open_dwg(self) -> None:
+        if not self._confirm_discard():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir DWG", "", DWG_FILTER)
+        if not path:
+            return
+        try:
+            open_dwg_document(self.ctx, path)
+        except DwgError as exc:
+            QMessageBox.critical(self, "Erro ao abrir DWG", str(exc))
+            return
+        self.ctx.message(f"Aberto (convertido de DWG): {Path(path).name}")
+
     def on_save(self) -> bool:
         if self.ctx.doc.path is None:
             return self.on_save_as()
@@ -385,6 +406,20 @@ class MainWindow(QMainWindow):
         self.ctx.message(f"Salvo: {p.name}  (+ {p.stem}.emap.json)")
         self._update_title()
         return True
+
+    def on_export_dwg(self) -> None:
+        default_name = self.ctx.doc.path.stem if self.ctx.doc.path else "desenho"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar DWG", default_name, DWG_FILTER
+        )
+        if not path:
+            return
+        try:
+            p = export_dwg_document(self.ctx, path)
+        except DwgError as exc:
+            QMessageBox.critical(self, "Erro ao exportar DWG", str(exc))
+            return
+        self.ctx.message(f"Exportado: {p.name}")
 
     # ---------------- raster ----------------
 
@@ -447,6 +482,9 @@ class MainWindow(QMainWindow):
 
     def on_diagnose(self) -> None:
         QMessageBox.information(self, "Diagnostico de raster", diagnose())
+
+    def on_diagnose_dwg(self) -> None:
+        QMessageBox.information(self, "Diagnostico de DWG", diagnose_dwg())
 
     # ---------------- shapefile ----------------
 
