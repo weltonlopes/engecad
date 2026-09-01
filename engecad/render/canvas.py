@@ -63,6 +63,11 @@ class CadCanvas(QWidget):
             return self._snap.point
         return self._cursor_world
 
+    @property
+    def current_snap(self):
+        """Snap que originou o ponto efetivo atual, para ferramentas associativas."""
+        return self._snap
+
     # ---------------- eventos de janela ----------------
 
     def resizeEvent(self, ev):
@@ -83,11 +88,12 @@ class CadCanvas(QWidget):
 
         self._cursor_screen = pos
         self._cursor_world = self.vp.screen_to_world(pos.x(), pos.y())
-        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp)
+        tool = self.ctx.tool
+        exclude = tool.snap_exclude() if tool is not None else ()
+        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp, exclude=exclude)
         self.snapChanged.emit(self._snap)
         self.coordinateMoved.emit(self.effective_point())
 
-        tool = self.ctx.tool
         if tool is not None:
             tool.on_mouse_move(self.effective_point(), ev)
         self.update()
@@ -131,7 +137,9 @@ class CadCanvas(QWidget):
         pos = ev.position()
         self.vp.zoom_at_screen(pos.x(), pos.y(), factor)
         self._cursor_world = self.vp.screen_to_world(pos.x(), pos.y())
-        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp)
+        tool = self.ctx.tool
+        exclude = tool.snap_exclude() if tool is not None else ()
+        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp, exclude=exclude)
         self.coordinateMoved.emit(self.effective_point())
         self._emit_view_changed()
         self.update()

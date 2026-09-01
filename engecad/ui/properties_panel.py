@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core.associative import association_status
 from ..core.dimensions import DIMENSION_TYPES, dimension_kind, dimension_measurement
 from ..core.entities import entity_insert_point, entity_polylines
 from ..core.geometry import Vec2, azimuth, format_dms, polygon_area, polyline_length
@@ -228,7 +229,7 @@ class PropertiesPanel(QWidget):
             self.btn_bylayer.setEnabled(True)
         self.btn_color.setStyleSheet(f"background-color: {aci_to_qcolor(abs(aci)).name()};")
 
-        self.lbl_measures.setText(_entity_measures(entity))
+        self.lbl_measures.setText(_entity_measures(entity, doc))
 
         self._vertices = [g for g in entity_grips(entity) if g.kind == VERTEX]
         if self._vertices:
@@ -322,7 +323,7 @@ class PropertiesPanel(QWidget):
             f"Vertice {self._vertex_index + 1} movido para {target.x:.3f}, {target.y:.3f}"
         )
         self._vertices = [g for g in entity_grips(self._entity) if g.kind == VERTEX]
-        self.lbl_measures.setText(_entity_measures(self._entity))
+        self.lbl_measures.setText(_entity_measures(self._entity, self.ctx.doc))
         self._refresh_vertex_fields()
 
     def _on_center_vertex(self) -> None:
@@ -357,7 +358,7 @@ def _entity_length(entity) -> float:
     return total
 
 
-def _entity_measures(entity) -> str:
+def _entity_measures(entity, doc=None) -> str:
     """Descricao das medidas relevantes, uma por linha, para a entidade unica."""
     t = entity.dxftype()
     dxf = entity.dxf
@@ -412,6 +413,14 @@ def _entity_measures(entity) -> str:
         lines.append(f"Tipo: {kind}")
         lines.append(f"Medida: {value:.3f} {unit}")
         lines.append(f"Estilo: {dxf.get('dimstyle', 'Standard')}")
+        if doc is not None:
+            total, resolved = association_status(doc, entity)
+            if total == 0:
+                lines.append("Associatividade: nao associada")
+            elif resolved == total:
+                lines.append(f"Associatividade: associada ({resolved}/{total})")
+            else:
+                lines.append(f"Associatividade: orfa ({resolved}/{total})")
         override = str(dxf.get("text", "<>"))
         if override not in ("", "<>"):
             lines.append(f"Texto substituto: {override}")

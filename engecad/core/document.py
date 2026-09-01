@@ -15,6 +15,13 @@ from pathlib import Path
 import ezdxf
 from ezdxf.document import Drawing
 
+from .associative import (
+    associated_dimensions,
+    rebind_replacement_associations,
+    remap_dimension_associations,
+    set_dimension_associations,
+    update_associative_dimension,
+)
 from .crs import ProjectCRS
 from .dimensions import (
     DIMENSION_TYPES,
@@ -65,6 +72,9 @@ class _EntityCommand(Command):
             if e.is_alive:
                 msp.add_entity(e)
                 self.doc._index_add(e)
+        self.doc._update_associative_dimensions(
+            {_entity_handle(e) for e in self.entities if _entity_handle(e)}
+        )
         self.doc._touch()
 
     def _unlink(self) -> None:
@@ -73,6 +83,9 @@ class _EntityCommand(Command):
             if e.is_alive:
                 self.doc._index_remove(e)
                 msp.unlink_entity(e)
+        self.doc._update_associative_dimensions(
+            {_entity_handle(e) for e in self.entities if _entity_handle(e)}
+        )
         self.doc._touch()
 
 
@@ -84,6 +97,11 @@ class AddEntities(_EntityCommand):
 class DeleteEntities(_EntityCommand):
     redo = _EntityCommand._unlink
     undo = _EntityCommand._link
+
+
+def _entity_handle(entity) -> str | None:
+    handle = entity.dxf.get("handle") if entity is not None else None
+    return str(handle) if handle else None
 
 
 class ModifyGeometry(Command):
@@ -314,6 +332,25 @@ class Document:
         self._by_handle.pop(h, None)
         self.index.remove(h)
 
+    def _update_associative_dimensions(
+        self, source_handles: set[str] | None = None, dimensions: Iterable = ()
+    ) -> list:
+        """Regenera dependentes; nao cria item de undo por conta propria."""
+        explicit = {e for e in dimensions if e is not None and e.is_alive}
+        targets = set(explicit)
+        if source_handles:
+            targets.update(associated_dimensions(self, {str(h) for h in source_handles}))
+        changed = []
+        for dimension in targets:
+            if update_associative_dimension(
+                self,
+                dimension,
+                preserve_dimension_location=dimension in explicit,
+            ):
+                self._index_update(dimension)
+                changed.append(dimension)
+        return changed
+
     def entity_by_handle(self, handle: str):
         return self._by_handle.get(handle)
 
@@ -392,9 +429,17 @@ class Document:
         )
         return self._register_new(e, "arco")
 
-    def _add_dimension(self, override, name: str):
+    def _add_dimension(
+        self,
+        override,
+        name: str,
+        associations: dict | None = None,
+        association_mode: str | None = None,
+    ):
         override.render()
-        return self._register_new(override.dimension, name)
+        dimension = override.dimension
+        set_dimension_associations(dimension, associations, association_mode)
+        return self._register_new(dimension, name)
 
     def _dim_attribs(self, layer: str | None, extra: dict | None = None) -> dict:
         return self._attribs(layer or "COTA", extra)
@@ -402,6 +447,7 @@ class Document:
     def add_linear_dimension(
         self, p1, p2, base, angle: float = 0.0, *, text: str = "<>",
         layer: str | None = None, style: str | None = None, override: dict | None = None,
+        associations: dict | None = None,
     ):
         p1, p2, base = Vec2.of(p1), Vec2.of(p2), Vec2.of(base)
         dimstyle = style or self.dimension_style_name
@@ -411,11 +457,12 @@ class Document:
             angle=float(angle), text=text, dimstyle=dimstyle, override=override,
             dxfattribs=self._dim_attribs(layer),
         )
-        return self._add_dimension(obj, "cota linear")
+        return self._add_dimension(obj, "cota linear", associations)
 
     def add_aligned_dimension(
         self, p1, p2, base, *, text: str = "<>", layer: str | None = None,
         style: str | None = None, override: dict | None = None,
+        associations: dict | None = None,
     ):
         p1, p2, base = Vec2.of(p1), Vec2.of(p2), Vec2.of(base)
         edge = p2 - p1
@@ -429,11 +476,12 @@ class Document:
             text=text, dimstyle=dimstyle, override=override,
             dxfattribs=self._dim_attribs(layer),
         )
-        return self._add_dimension(obj, "cota alinhada")
+        return self._add_dimension(obj, "cota alinhada", associations, "aligned")
 
     def add_angular_dimension(
         self, center, p1, p2, base, *, text: str = "<>", layer: str | None = None,
         style: str | None = None, override: dict | None = None,
+        associations: dict | None = None,
     ):
         center, p1, p2, base = map(Vec2.of, (center, p1, p2, base))
         dimstyle = style or self.dimension_style_name
@@ -443,11 +491,12 @@ class Document:
             p1=(p1.x, p1.y), p2=(p2.x, p2.y), text=text,
             dimstyle=dimstyle, override=override, dxfattribs=self._dim_attribs(layer),
         )
-        return self._add_dimension(obj, "cota angular")
+        return self._add_dimension(obj, "cota angular", associations)
 
     def add_radius_dimension(
         self, center, radius: float, placement, *, text: str = "<>",
         layer: str | None = None, style: str | None = None, override: dict | None = None,
+        associations: dict | None = None,
     ):
         center, placement = Vec2.of(center), Vec2.of(placement)
         if radius <= 1e-9:
@@ -461,11 +510,12 @@ class Document:
             location=(placement.x, placement.y), text=text, dimstyle=dimstyle,
             override=override, dxfattribs=self._dim_attribs(layer),
         )
-        return self._add_dimension(obj, "cota de raio")
+        return self._add_dimension(obj, "cota de raio", associations)
 
     def add_diameter_dimension(
         self, center, radius: float, placement, *, text: str = "<>",
         layer: str | None = None, style: str | None = None, override: dict | None = None,
+        associations: dict | None = None,
     ):
         center, placement = Vec2.of(center), Vec2.of(placement)
         if radius <= 1e-9:
@@ -479,12 +529,12 @@ class Document:
             location=(placement.x, placement.y), text=text, dimstyle=dimstyle,
             override=override, dxfattribs=self._dim_attribs(layer),
         )
-        return self._add_dimension(obj, "cota de diametro")
+        return self._add_dimension(obj, "cota de diametro", associations)
 
     def add_ordinate_dimension(
         self, feature, leader_end, *, x_type: bool | None = None, origin=(0, 0),
         text: str = "<>", layer: str | None = None, style: str | None = None,
-        override: dict | None = None,
+        override: dict | None = None, associations: dict | None = None,
     ):
         feature, leader_end, origin = Vec2.of(feature), Vec2.of(leader_end), Vec2.of(origin)
         offset = leader_end - feature
@@ -497,11 +547,12 @@ class Document:
             dtype=1 if x_type else 0, origin=(origin.x, origin.y), text=text,
             dimstyle=dimstyle, override=override, dxfattribs=self._dim_attribs(layer),
         )
-        return self._add_dimension(obj, "cota ordenada")
+        return self._add_dimension(obj, "cota ordenada", associations)
 
     def add_arc_length_dimension(
         self, center, p1, p2, base, *, text: str = "<>", layer: str | None = None,
         style: str | None = None, override: dict | None = None,
+        associations: dict | None = None,
     ):
         center, p1, p2, base = map(Vec2.of, (center, p1, p2, base))
         dimstyle = style or self.dimension_style_name
@@ -511,7 +562,7 @@ class Document:
             p1=(p1.x, p1.y), p2=(p2.x, p2.y), text=text,
             dimstyle=dimstyle, override=override, dxfattribs=self._dim_attribs(layer),
         )
-        return self._add_dimension(obj, "comprimento de arco")
+        return self._add_dimension(obj, "comprimento de arco", associations)
 
     # ---------------- edicao ----------------
 
@@ -527,9 +578,18 @@ class Document:
         Entidades de tipo nao suportado pelo snapshot sao ignoradas em vez de
         entrarem no undo pela metade.
         """
-        items = [e for e in entities if e is not None and e.is_alive]
-        before = [(e, snapshot(e)) for e in items]
+        items = list(dict.fromkeys(e for e in entities if e is not None and e.is_alive))
+        source_handles = {_entity_handle(e) for e in items if e.dxftype() not in DIMENSION_TYPES}
+        source_handles.discard(None)
+        dependents = associated_dimensions(self, source_handles) if source_handles else []
+        tracked = list(dict.fromkeys([*items, *dependents]))
+        before = [(e, snapshot(e)) for e in tracked]
         yield items
+        for entity in items:
+            if entity.is_alive:
+                self._index_update(entity)
+        explicit_dimensions = [e for e in items if e.dxftype() in DIMENSION_TYPES]
+        self._update_associative_dimensions(source_handles, explicit_dimensions)
         records = []
         for entity, antes in before:
             if antes is None or not entity.is_alive:
@@ -550,17 +610,29 @@ class Document:
 
     def copy_entities(self, entities: Iterable, matrix=None, name: str = "copiar") -> list:
         """Duplica entidades (opcionalmente transformadas) como novas do desenho."""
+        originals = [e for e in entities if e is not None and e.is_alive]
         made = []
-        for e in entities:
-            if e is None or not e.is_alive:
-                continue
+        pairs = []
+        for e in originals:
             clone = e.copy()
             if matrix is not None:
                 clone.transform(matrix)
             self.msp.add_entity(clone)
             self._index_add(clone)
             made.append(clone)
+            pairs.append((e, clone))
         if made:
+            handle_map = {
+                old: new
+                for original, clone in pairs
+                if (old := _entity_handle(original)) and (new := _entity_handle(clone))
+            }
+            copied_dimensions = []
+            for _, clone in pairs:
+                if clone.dxftype() in DIMENSION_TYPES:
+                    remap_dimension_associations(clone, handle_map)
+                    copied_dimensions.append(clone)
+            self._update_associative_dimensions(dimensions=copied_dimensions)
             self.undo.push(AddEntities(self, made, name), execute=False)
             self._touch()
         return made
@@ -583,6 +655,17 @@ class Document:
         finally:
             self.undo.end_macro()
         return created
+
+    def rebind_replacement_associations(self, old, replacements) -> int:
+        """Mantem cotas ligadas aos pedacos sobreviventes de uma substituicao."""
+        handle = _entity_handle(old)
+        dimensions = associated_dimensions(self, {handle}) if handle else []
+        if not dimensions:
+            return 0
+        count = 0
+        with self.editing(dimensions, "reassociar apos aparar"):
+            count = rebind_replacement_associations(self, old, replacements)
+        return count
 
     # atributos opcionais do DXF: sem isso, dxf.get() devolve None para uma
     # entidade que nunca teve o atributo setado, e regravar None quebra o ezdxf.

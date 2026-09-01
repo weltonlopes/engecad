@@ -143,6 +143,22 @@ def dimension_kind(entity) -> str:
     }.get(kind, "cota")
 
 
+def dimension_anchor_attributes(entity) -> tuple[str, ...]:
+    """Pontos de definicao que podem ser associados a geometria externa."""
+    if entity.dxftype() == "ARC_DIMENSION":
+        return ("defpoint4", "defpoint2", "defpoint3")
+    kind = int(entity.dxf.get("dimtype", 0) or 0) & 15
+    return {
+        0: ("defpoint2", "defpoint3"),
+        1: ("defpoint2", "defpoint3"),
+        2: ("defpoint2", "defpoint3", "defpoint4"),
+        3: ("defpoint", "defpoint4"),
+        4: ("defpoint", "defpoint4"),
+        5: ("defpoint4", "defpoint2", "defpoint3"),
+        6: ("defpoint2",),
+    }.get(kind, ())
+
+
 def dimension_measurement(entity) -> float:
     """Valor escalar medido, inclusive para tipos que o ezdxf devolve em tupla."""
     if entity.dxftype() == "ARC_DIMENSION":

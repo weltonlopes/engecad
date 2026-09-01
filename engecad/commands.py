@@ -15,6 +15,7 @@ from .tools.dimension import (
     LinearDimensionTool,
     OrdinateDimensionTool,
     RadiusDimensionTool,
+    ReassociateDimensionTool,
 )
 from .tools.draw import LineTool, PolylineTool
 from .tools.measure import AreaTool, DistanceTool
@@ -100,6 +101,17 @@ def register_builtin_commands(reg) -> None:
     reg.register(
         "DIMSTYLE", _dimension_style, ("D", "COTAESTILO"),
         "Consulta/altera o estilo de cotas", "cotas", False,
+    )
+    reg.register(
+        "DIMREASSOCIATE", lambda ctx, *a: ReassociateDimensionTool(ctx),
+        ("DRE", "COTAREASSOCIAR"), "Reassocia pontos de uma cota", "cotas",
+    )
+    reg.register(
+        "DIMDISASSOCIATE", _dimension_disassociate, ("DDA", "COTADESASSOCIAR"),
+        "Remove os vinculos associativos das cotas selecionadas", "cotas", False,
+    )
+    reg.register(
+        "DIMREGEN", _dimension_regen, (), "Regenera todas as cotas associativas", "cotas", False
     )
 
     # ---- modificar ----
@@ -353,3 +365,27 @@ def _dimension_style(ctx, *args):
     updated = replace(settings, **changes)
     ctx.doc.update_dimension_style(updated)
     ctx.message(f"Estilo de cotas {ctx.doc.dimension_style_name} atualizado")
+
+
+def _dimension_disassociate(ctx, *args):
+    from .core.associative import detach_dimension_anchor
+    from .core.dimensions import DIMENSION_TYPES
+
+    dimensions = [e for e in ctx.selection if e.dxftype() in DIMENSION_TYPES]
+    if not dimensions:
+        ctx.message("Selecione uma ou mais cotas")
+        return
+    with ctx.doc.editing(dimensions, "desassociar cotas"):
+        for entity in dimensions:
+            detach_dimension_anchor(entity)
+    ctx.message(f"{len(dimensions)} cota(s) desassociada(s)")
+
+
+def _dimension_regen(ctx, *args):
+    from .core.associative import associated_dimensions
+
+    dimensions = associated_dimensions(ctx.doc)
+    changed = ctx.doc._update_associative_dimensions(dimensions=dimensions)
+    if changed:
+        ctx.doc._touch()
+    ctx.message(f"{len(dimensions)} cota(s) associativa(s) regenerada(s)")

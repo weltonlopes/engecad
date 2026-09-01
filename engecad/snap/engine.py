@@ -119,7 +119,7 @@ class SnapEngine:
                     continue
                 ip = line_intersection(a1, a2, b1, b2, as_segments=True)
                 if ip is not None:
-                    consider("intersection", ip, e1)
+                    consider("intersection", ip, (e1, e2))
 
         # Nearest: ponto mais proximo sobre a geometria.
         if "nearest" in self.enabled:

@@ -189,6 +189,12 @@ class MainWindow(QMainWindow):
         m_dim.addAction(self._act("&Ordenada", lambda: self.run("DIMORDINATE"), tip="alias: DOR"))
         m_dim.addSeparator()
         m_dim.addAction(self._act("&Estilo de cotas...", self.on_dimension_style, tip="DIMSTYLE"))
+        m_dim.addAction(
+            self._act("&Reassociar cota", lambda: self.run("DIMREASSOCIATE"), tip="DRE")
+        )
+        m_dim.addAction(
+            self._act("&Desassociar cota", lambda: self.run("DIMDISASSOCIATE"), tip="DDA")
+        )
 
         m_mod = self.menuBar().addMenu("&Modificar")
         m_mod.addAction(self._act("&Mover", lambda: self.run("MOVE"), tip="alias: M"))

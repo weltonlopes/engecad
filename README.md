@@ -40,7 +40,7 @@ python -m engecad planta.dxf     # abre um desenho direto
 | **Coordenadas** | CRS via PROJ/pyproj, SIRGAS 2000 / UTM pré-configurado, E/N ao vivo na barra de status |
 | **Imagem de fundo** | GeoTIFF/COG, JP2, ECW (ver abaixo), reprojeção on-the-fly, leitura decimada por overviews |
 | **Desenho** | linha, polilinha, retângulo, círculo, arco por 3 pontos, texto |
-| **Cotas DXF** | linear, alinhada, rotacionada, angular, raio, diâmetro, arco e ordenada; DIMSTYLE métrico |
+| **Cotas DXF** | linear, alinhada, rotacionada, angular, raio, diâmetro, arco e ordenada; associativas e com DIMSTYLE métrico |
 | **Seleção** | clique, janela (→) e captura (←), Shift para somar/tirar, realce ao passar o cursor |
 | **Grips** | esticar vértice, mover entidade, mudar raio e ângulo — arrastando, sem comando |
 | **Edição** | mover, copiar, girar, espelhar, escalar, paralela, aparar, estender, apagar |
@@ -85,6 +85,8 @@ embaixo antes de cada comando.
 | `DIMDIAMETER` `DDI` | | |
 | `DIMARC` `DAR` | | |
 | `DIMORDINATE` `DOR` | | |
+| `DIMREASSOCIATE` `DRE` | | |
+| `DIMDISASSOCIATE` `DDA` | | |
 | | `TRIM` `TR` | `CAMADA` `LA` |
 | | `EXTEND` `EX` | `U` / `REDO` |
 | | `ERASE` `E` / `Del` | `AJUDA` `F1` |
@@ -92,6 +94,12 @@ embaixo antes de cada comando.
 
 Dentro de `TRIM` e `EXTEND`, digitar `U` desfaz o último corte sem sair da
 ferramenta. `Enter` no prompt vazio repete o último comando.
+
+As cotas criadas sobre pontos de `OSNAP` ficam associadas às entidades de
+origem e acompanham alterações de vértices, raios, MOVE, ROTATE e SCALE. Pontos
+digitados permanecem fixos. Se uma origem for apagada, a cota fica órfã sem
+perder seu último valor; `DIMREASSOCIATE` refaz os vínculos e
+`DIMDISASSOCIATE` os remove deliberadamente.
 
 ---
 
@@ -209,13 +217,15 @@ testáveis sem abrir janela.
 pytest -q
 ```
 
-227 testes. Os que mais importam:
+241 testes. Os que mais importam:
 
 - ida e volta `mundo → tela → mundo` com coordenada UTM real (exigido < 1 mm; medido: 0);
 - zoom ancorado 60× sem deriva do ponto sob o cursor;
 - mover e desfazer devolvendo a coordenada **exata**, e 50 ciclos undo/redo sem deriva;
 - aparar terminando exatamente sobre o círculo (interseção analítica, não achatada);
 - round-trip DXF: criar → salvar → reabrir → geometria idêntica;
+- cotas associativas acompanhando MOVE, SCALE, grips, interseções e alteração de raio,
+  inclusive depois de salvar/reabrir e em ciclos de undo/redo;
 - snap escolhendo o candidato certo por prioridade e por raio em pixels;
 - script no console desfazendo num passo, e script que falha não deixando resíduo;
 - **desenhar sobre a ortofoto e conferir que o DXF salvo tem a coordenada do mundo real;**

@@ -173,6 +173,7 @@ def drag_grip(entity, grip: Grip, target: Vec2) -> bool:
         return True
 
     if t in ("DIMENSION", "ARC_DIMENSION"):
+        from .associative import detach_dimension_anchor
         from .dimensions import rerender_dimension
 
         if grip.kind == DIM_TEXT:
@@ -196,7 +197,9 @@ def drag_grip(entity, grip: Grip, target: Vec2) -> bool:
                 }.get(kind, ())
             if not 0 <= grip.index < len(attrs):
                 return False
-            setattr(dxf, attrs[grip.index], (target.x, target.y, 0.0))
+            attribute = attrs[grip.index]
+            detach_dimension_anchor(entity, attribute)
+            setattr(dxf, attribute, (target.x, target.y, 0.0))
             rerender_dimension(entity)
             return True
 

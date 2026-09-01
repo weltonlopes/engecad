@@ -112,6 +112,8 @@ def snapshot(entity) -> dict | None:
         }
 
     if t in ("DIMENSION", "ARC_DIMENSION"):
+        from .associative import get_dimension_association_mode, get_dimension_associations
+
         snap = {"_t": t}
         for attr in (
             "defpoint", "defpoint2", "defpoint3", "defpoint4", "defpoint5",
@@ -129,6 +131,8 @@ def snapshot(entity) -> dict | None:
                 snap[attr] = int(dxf.get(attr))
         snap["dimtype"] = int(dxf.get("dimtype", 0) or 0)
         snap["text"] = str(dxf.get("text", "<>"))
+        snap["associations"] = get_dimension_associations(entity)
+        snap["association_mode"] = get_dimension_association_mode(entity)
         return snap
 
     return None
@@ -200,11 +204,15 @@ def restore(entity, snap: dict | None) -> bool:
         return True
 
     if t in ("DIMENSION", "ARC_DIMENSION"):
+        from .associative import set_dimension_associations
         from .dimensions import rerender_dimension
 
         for attr, value in snap.items():
-            if attr != "_t":
+            if attr not in ("_t", "associations", "association_mode"):
                 setattr(dxf, attr, value)
+        set_dimension_associations(
+            entity, snap.get("associations"), snap.get("association_mode")
+        )
         rerender_dimension(entity)
         return True
 
