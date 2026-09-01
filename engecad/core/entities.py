@@ -61,10 +61,51 @@ def _decompose(entity) -> list:
     return out
 
 
+_TEXTUAL = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
+_block_text: dict[str, bool] = {}
+
+
+def insert_has_text(insert) -> bool:
+    """A referencia de bloco contribui algum texto para a tela?
+
+    Um cadastro tem milhares de blocos de simbolo -- poste, arvore, bueiro --
+    que sao pura geometria. Descobrir isso decompondo cada um custa 79 us por
+    referencia; a resposta depende so da DEFINICAO do bloco, entao vale por nome.
+    """
+    if insert.attribs:
+        return True
+    name = insert.dxf.get("name", "")
+    hit = _block_text.get(name)
+    if hit is None:
+        hit = _block_definition_has_text(insert.doc, name, set())
+        _block_text[name] = hit
+    return hit
+
+
+def _block_definition_has_text(doc, name: str, seen: set[str]) -> bool:
+    if doc is None or name in seen:
+        return False
+    seen.add(name)
+    try:
+        block = doc.blocks.get(name)
+    except Exception:
+        return False
+    if block is None:
+        return False
+    for e in block:
+        t = e.dxftype()
+        if t in _TEXTUAL:
+            return True
+        if t == "INSERT" and _block_definition_has_text(doc, e.dxf.get("name", ""), seen):
+            return True
+    return False
+
+
 def invalidate_primitives(handle: str | None = None) -> None:
     """Descarta o cache de primitivas de uma entidade, ou de todas."""
     if handle is None:
         _primitive_cache.clear()
+        _block_text.clear()
     else:
         _primitive_cache.pop(handle, None)
 
@@ -144,8 +185,12 @@ def _apart(a: tuple[float, float], b: tuple[float, float]) -> bool:
 
 def _is_plan(entity) -> bool:
     """A entidade esta no plano XY do mundo? Se nao, precisa da conversao OCS."""
-    e = entity.dxf.get("extrusion", None)
-    return e is None or (abs(e[0]) < 1e-12 and abs(e[1]) < 1e-12 and e[2] > 0)
+    dxf = entity.dxf
+    # hasattr custa um decimo do get, e a extrusao quase nunca esta escrita.
+    if not dxf.hasattr("extrusion"):
+        return True
+    e = dxf.extrusion
+    return abs(e[0]) < 1e-12 and abs(e[1]) < 1e-12 and e[2] > 0
 
 
 def _fast_points(entity, dxftype: str, sagitta: float):
@@ -165,14 +210,25 @@ def _fast_points(entity, dxftype: str, sagitta: float):
             return [[(a.x, a.y), (b.x, b.y)]]
 
         if dxftype == "LWPOLYLINE":
-            if entity.has_arc or not _is_plan(entity):
+            if not _is_plan(entity):
                 return None
-            pts = [(p[0], p[1]) for p in entity.lwpoints]
+            # Ler os vertices e detectar bulge na MESMA passada. `has_arc`
+            # percorre a polilinha inteira por conta propria, e uma curva de
+            # nivel tem centenas de vertices: a checagem separada custava tanto
+            # quanto o resto do achatamento.
+            pts = []
+            for p in entity.lwpoints:
+                if p[4]:  # bulge: o arco vai pelo caminho generico
+                    return None
+                pts.append((p[0], p[1]))
             if len(pts) < 2:
                 return []
             if entity.closed and _apart(pts[0], pts[-1]):
                 pts.append(pts[0])
             return [pts]
+
+        if dxftype == "HATCH":
+            return _hatch_boundary_points(entity)
 
         if dxftype == "CIRCLE":
             if not _is_plan(entity):
@@ -196,6 +252,31 @@ def _fast_points(entity, dxftype: str, sagitta: float):
     except (AttributeError, TypeError, ValueError, IndexError):
         return None
     return None
+
+
+def _hatch_boundary_points(hatch):
+    """Contornos de uma hachura cujas bordas sao poligonais retas.
+
+    E o caso comum -- um lote, uma area de uso do solo. Sem isto, cada contorno
+    passa pelo conversor generico do ezdxf e vira um Path com Beziers, so para
+    ser achatado de volta em segmentos.
+    """
+    out: list[list[tuple[float, float]]] = []
+    for boundary in hatch.paths:
+        vertices = getattr(boundary, "vertices", None)
+        if vertices is None:  # borda com arcos, elipses ou splines
+            return None
+        pts = []
+        for v in vertices:
+            if len(v) > 2 and v[2]:  # bulge
+                return None
+            pts.append((v[0], v[1]))
+        if len(pts) < 2:
+            continue
+        if _apart(pts[0], pts[-1]):
+            pts.append(pts[0])
+        out.append(pts)
+    return out
 
 
 def _arc_points(cx, cy, r, a0, a1, sagitta, closed: bool = False):

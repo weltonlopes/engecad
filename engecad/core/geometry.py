@@ -86,6 +86,54 @@ class Vec2:
         return Vec2(float(p[0]), float(p[1]))
 
 
+def decimate(points, tolerance: float):
+    """Descarta vertices que nao afastam a linha mais que `tolerance`.
+
+    Douglas-Peucker, iterativo: divide no vertice mais distante da corda e para
+    quando o que sobra cabe na tolerancia. O resultado tem garantia -- nenhum
+    vertice descartado fica a mais de `tolerance` da linha simplificada.
+
+    Uma passada unica comparando cada candidato com a corda do momento seria mais
+    barata, mas o erro se acumula ao longo de um trecho descartado e passa do
+    dobro do pedido. Aqui o desenho depende disso para o zoom aberto nao ficar
+    torto, entao vale as passadas a mais.
+    """
+    n = len(points)
+    if n < 3 or tolerance <= 0:
+        return points
+    t2 = tolerance * tolerance
+    keep = bytearray(n)
+    keep[0] = keep[n - 1] = 1
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        ax, ay = points[i]
+        dx, dy = points[j][0] - ax, points[j][1] - ay
+        length = dx * dx + dy * dy
+        worst, at = -1.0, -1
+        for k in range(i + 1, j):
+            px, py = points[k]
+            ex, ey = px - ax, py - ay
+            if length > 0.0:
+                u = (ex * dx + ey * dy) / length
+                if u < 0.0:
+                    u = 0.0
+                elif u > 1.0:
+                    u = 1.0
+                ex -= u * dx
+                ey -= u * dy
+            d2 = ex * ex + ey * ey
+            if d2 > worst:
+                worst, at = d2, k
+        if worst > t2:
+            keep[at] = 1
+            stack.append((i, at))
+            stack.append((at, j))
+    return [points[k] for k in range(n) if keep[k]]
+
+
 @dataclass(frozen=True, slots=True)
 class BBox:
     """Retangulo alinhado aos eixos. minx>maxx sinaliza bbox vazia."""

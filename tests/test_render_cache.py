@@ -145,6 +145,106 @@ def test_fast_bbox_contains_the_generic_one(build):
     assert got.maxy >= ref.extmax.y - 1e-6
 
 
+# ---------------- simplificacao por nivel ----------------
+
+
+def test_decimate_keeps_the_ends_and_collapses_straight_runs():
+    from engecad.core.geometry import decimate
+
+    reta = [(float(i), 0.0) for i in range(20)]
+    assert decimate(reta, 0.5) == [(0.0, 0.0), (19.0, 0.0)]
+
+    zigue = [(0.0, 0.0), (1.0, 0.05), (2.0, 0.0), (3.0, 5.0), (4.0, 0.0)]
+    got = decimate(zigue, 0.5)
+    assert got[0] == zigue[0] and got[-1] == zigue[-1]
+    assert (3.0, 5.0) in got, "o vertice que muda a forma tem de sobreviver"
+    assert (1.0, 0.05) not in got, "o desvio abaixo da tolerancia deve sumir"
+
+
+@pytest.mark.parametrize("tol", [0.05, 0.3, 2.0])
+def test_decimate_respects_the_tolerance(tol):
+    """Nenhum vertice descartado pode ficar alem da tolerancia da nova linha."""
+    from engecad.core.geometry import decimate, distance_to_segment
+
+    curva = [(i * 0.5, math.sin(i * 0.01) * 12.0 + math.sin(i * 0.31) * 0.4)
+             for i in range(400)]
+    simples = decimate(curva, tol)
+    assert 2 <= len(simples) <= len(curva)
+    for p in curva:
+        best = min(
+            distance_to_segment(Vec2(*p), Vec2(*a), Vec2(*b))
+            for a, b in zip(simples, simples[1:], strict=False)
+        )
+        assert best <= tol * 1.001
+
+
+def _bake_one(entity, doc, upw):
+    """Assa uma entidade sozinha na oitava correspondente a `upw` e devolve a celula."""
+    from engecad.render.displaylist import DisplayList, _Cell
+
+    doc.invalidate_all_geometry()  # a display list e consumidora unica das mudancas
+    display = DisplayList(doc)
+    display.sync()
+    level = int(math.floor(math.log2(upw)))
+    cell = _Cell()
+    i = display._slot[entity.dxf.get("handle")]
+    display._bake(
+        cell, entity, (2.0**level) * 0.4, 0.0, 0.0, 0, 7,
+        float(display._size[i]) / (2.0**level),
+    )
+    return cell
+
+
+def test_hatch_pattern_becomes_a_stain_when_it_is_small_on_screen():
+    doc = Document.new()
+    pts = [(E, N), (E + 20, N), (E + 20, N + 20), (E, N + 20)]
+    hatch = doc.msp.add_hatch()
+    hatch.set_pattern_fill("ANSI31", scale=0.25)
+    hatch.paths.add_polyline_path(pts, is_closed=True)
+    doc.rebuild_index()
+
+    perto = _bake_one(hatch, doc, 0.05)  # 20 m = 400 px
+    assert perto.strokes and not perto.fills, "de perto o padrao tem de aparecer"
+
+    longe = _bake_one(hatch, doc, 1.0)  # 20 m = 20 px
+    assert longe.fills and not longe.strokes, "de longe vira mancha"
+    assert longe.verts < perto.verts / 4
+
+
+def test_small_block_is_baked_as_a_mark_instead_of_the_symbol():
+    doc = Document.new()
+    blk = doc.drawing.blocks.new("SIMBOLO")
+    for k in range(12):
+        a = k * math.tau / 12
+        blk.add_line((0, 0), (math.cos(a), math.sin(a)))
+    blk.add_circle((0, 0), 1.0)
+    ref = doc.msp.add_blockref("SIMBOLO", (E, N))
+    doc.rebuild_index()
+
+    perto = _bake_one(ref, doc, 0.02)  # 2 m = 100 px
+    longe = _bake_one(ref, doc, 0.5)  # 2 m = 4 px
+    assert perto.verts > 30, "de perto o simbolo inteiro"
+    assert longe.verts <= 4, "de longe so a marca"
+
+
+def test_block_without_text_skips_the_label_pass():
+    from engecad.core.entities import insert_has_text
+
+    doc = Document.new()
+    simbolo = doc.drawing.blocks.new("SO_GEOMETRIA")
+    simbolo.add_circle((0, 0), 1.0)
+    com_texto = doc.drawing.blocks.new("COM_TEXTO")
+    com_texto.add_circle((0, 0), 1.0)
+    com_texto.add_text("NORTE", height=1.0)
+
+    assert not insert_has_text(doc.msp.add_blockref("SO_GEOMETRIA", (E, N)))
+    assert insert_has_text(doc.msp.add_blockref("COM_TEXTO", (E, N)))
+
+    aninhado = doc.drawing.blocks.new("ANINHADO")
+    aninhado.add_blockref("COM_TEXTO", (0, 0))
+    assert insert_has_text(doc.msp.add_blockref("ANINHADO", (E, N)))
+
+
 # ---------------- display list acompanha o documento ----------------
 
 

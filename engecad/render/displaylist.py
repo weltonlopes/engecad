@@ -37,17 +37,34 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QTransform
 
 from ..core.dimensions import DIMENSION_TYPES
-from ..core.entities import POINT_LIKE, entity_point_lists
+from ..core.entities import POINT_LIKE, entity_point_lists, insert_has_text
+from ..core.geometry import decimate
 from .styles import aci_to_qcolor
 
-TILE_PX = 512.0  # aresta do tile, em pixels de tela da oitava a que ele pertence
-TILE_ENTITIES = 1_500  # alvo de entidades por tile, usado como piso do tamanho
+# Aresta da celula base, em pixels de tela da oitava. Um tile e a menor unidade
+# que o desenho progressivo consegue emitir: a construcao dele e fatiavel, mas o
+# drawPath do resultado nao. Com 512 px, um tile denso levava 100 ms para ser
+# desenhado e furava o orcamento da fatia.
+TILE_PX = 256.0
+MAX_RANK = 6  # classes de tamanho acima da celula base (ver _buckets_for)
 TINY_PX = 2.0  # entidade menor que isto vira tinta em vez de vetor
 MAX_VECTOR_ENTITIES = 30_000  # acima disso sobe uma oitava (LOD mais agressivo)
 MAX_LEVEL_ESCALATION = 2  # teto da escalada: tinta nunca engole nada > ~8 px
 MAX_CACHED_VERTS = 3_000_000  # teto do cache de tiles, em vertices
 MAX_MARKERS = 3_000  # textos/pontos rotulados por quadro
 MAX_HATCH_LINES = 5_000  # linhas de padrao por hachura
+
+# LOD por tipo -- tamanho na tela, em pixels, abaixo do qual nao vale desenhar a
+# coisa inteira. Uma hachura de 20 px nao mostra o padrao, so uma mancha; um
+# bloco de simbolo de 10 px nao mostra o desenho do simbolo, so uma marca. Sem
+# esses cortes, entrar num zoom intermediario de um cadastro hachurado assava
+# 2.7 milhoes de vertices e levava 20 s.
+HATCH_PATTERN_MIN_PX = 64.0
+HATCH_SOLID_ALPHA = 90  # opacidade da mancha que substitui o padrao
+BLOCK_DETAIL_MIN_PX = 20.0
+# Simplificar uma polilinha curta nunca tira vertice -- um retangulo de lote tem
+# cinco e todos sao cantos. So vale a pena onde ha vertices para descartar.
+DECIMATE_MIN_VERTS = 8
 # Conferir o relogio a cada entidade custaria mais que processar uma; a cada 512
 # o desvio do orcamento fica bem abaixo de um milissegundo.
 _CHUNK = 512
@@ -336,7 +353,11 @@ class DisplayList:
         if t not in POINT_LIKE or t == "INSERT":
             flags |= _GEOMETRY
         if t in _MARKER_TYPES:
-            flags |= _MARKER
+            # Um bloco so precisa do passe de rotulo se tiver texto dentro; a
+            # maioria num cadastro e simbolo puro, e decompor cada um para
+            # descobrir que nao ha texto custava quase um segundo por vista.
+            if t != "INSERT" or insert_has_text(entity):
+                flags |= _MARKER
         self._flags[i] = flags
 
     def _refresh_slot(self, handle: str) -> None:
@@ -378,16 +399,13 @@ class DisplayList:
         ox, oy = self._origin
         dead = []
         for key in self._cells:
-            level, tx, ty = key
-            if tx is None:  # balde dos grandes demais: sempre suspeito
-                dead.append(key)
-                continue
-            ts = self._tile_size(level)
+            level, (rank, tx, ty) = key
+            cell = self._tile_size(level) * (2.0**rank)
             if (
-                box[0] - ts <= ox + (tx + 1) * ts
-                and box[2] + ts >= ox + tx * ts
-                and box[1] - ts <= oy + (ty + 1) * ts
-                and box[3] + ts >= oy + ty * ts
+                box[0] - cell <= ox + (tx + 1) * cell
+                and box[2] + cell >= ox + tx * cell
+                and box[1] - cell <= oy + (ty + 1) * cell
+                and box[3] + cell >= oy + ty * cell
             ):
                 dead.append(key)
         for key in dead:
@@ -406,14 +424,13 @@ class DisplayList:
     # ---------------- parametros de nivel ----------------
 
     def _tile_size(self, level: int) -> float:
-        """Aresta do tile: 512 px da oitava, mas nunca menor que o piso do dado.
+        """Aresta da celula base: 512 px da oitava.
 
-        Fazer o tile encolher junto com o zoom parece natural e esta errado: la
-        embaixo ele fica menor que as proprias entidades, todas caem no balde dos
-        grandes demais e o cache deixa de recortar coisa alguma. O piso vem da
-        densidade do desenho, para o tile guardar sempre um punhado de entidades.
+        Encolhe junto com o zoom, e e o que se quer -- assim uma vista de perto
+        carrega so o que esta perto. Quem nao cabe nessa celula nao vira excecao:
+        entra numa classe de tamanho maior (ver _buckets_for).
         """
-        return min(max(self._floor_tile, (2.0**level) * TILE_PX), self._ceil_tile)
+        return min(max((2.0**level) * TILE_PX, self._floor_tile), self._ceil_tile)
 
     def _measure_density(self) -> None:
         """Piso do tamanho do tile, a partir da densidade e do porte das entidades."""
@@ -427,12 +444,9 @@ class DisplayList:
             return
         width = float(np.nanmax(bb[:, 2]) - np.nanmin(bb[:, 0]))
         height = float(np.nanmax(bb[:, 3]) - np.nanmin(bb[:, 1]))
-        area = max(width * height, 1e-9)
-        by_density = math.sqrt(TILE_ENTITIES * area / n)
-        # E o tile precisa acomodar a entidade tipica, senao ela vira "grande
-        # demais" e passa a ser desenhada em toda vista.
-        by_size = float(np.percentile(self._size[ok], 95)) * 4.0
-        self._floor_tile = max(by_density, by_size, 1e-6)
+        # Piso: uma celula menor que a entidade mediana joga quase tudo nas
+        # classes maiores e desperdica a divisao.
+        self._floor_tile = max(float(np.median(self._size[ok])) * 2.0, 1e-6)
         # Teto: um tile do tamanho do desenho inteiro faria o cache guardar tudo
         # num unico path, e editar uma entidade jogaria o desenho todo fora.
         self._ceil_tile = max(max(width, height) / 4.0, self._floor_tile)
@@ -493,9 +507,12 @@ class DisplayList:
         flags = self._flags[idx]
         size = self._size[idx]
         has_geom = (flags & _GEOMETRY).astype(bool)
-        markers = idx[(flags & _MARKER).astype(bool)]
+        tiny = has_geom & (size < thr)
+        # Um bloco sub-pixel ja virou tinta: rotula-lo seria trabalho dobrado
+        # para o mesmo pixel.
+        markers = idx[(flags & _MARKER).astype(bool) & ~tiny]
         vectors = idx[has_geom & (size >= thr)]
-        ink = idx[has_geom & (size < thr)]
+        ink = idx[tiny]
 
         if markers.size > MAX_MARKERS:
             # Rotular nao cabe no orcamento: o texto vira tinta, como o QTEXT do
@@ -581,30 +598,39 @@ class DisplayList:
         """Tiles a desenhar, do centro da vista para fora.
 
         A ordem importa no desenho progressivo: numa regeneracao longa o usuario
-        ve primeiro o que esta olhando, e a periferia chega depois.
+        ve primeiro o que esta olhando, e a periferia chega depois. As classes
+        maiores vem antes, porque sao poucas e cobrem area grande.
         """
         if idx.size == 0:
             return []
-        ox, oy = self._origin
-        ts = self._tile_size(level)
-        vis = vp.visible_bbox()
-        tx0 = int(math.floor((vis.minx - ox) / ts)) - 1
-        tx1 = int(math.floor((vis.maxx - ox) / ts)) + 1
-        ty0 = int(math.floor((vis.miny - oy) / ts)) - 1
-        ty1 = int(math.floor((vis.maxy - oy) / ts)) + 1
-        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 4096:  # vista absurda: nada a fazer
+        groups, ranks = self._buckets_for(level)
+        if not groups:
             return []
-
+        ox, oy = self._origin
+        base = self._tile_size(level)
+        vis = vp.visible_bbox()
         cx, cy = vp.center.x - ox, vp.center.y - oy
+
         keys = []
-        for tx in range(tx0, tx1 + 1):
-            for ty in range(ty0, ty1 + 1):
-                dx = (tx + 0.5) * ts - cx
-                dy = (ty + 0.5) * ts - cy
-                keys.append((dx * dx + dy * dy, (tx, ty)))
-        keys.sort(key=lambda item: item[0])
-        # O balde dos grandes demais atravessa a vista inteira: vem antes.
-        return [(None, None)] + [k for _, k in keys]
+        for rank in reversed(ranks):
+            cell = base * (2.0**rank)
+            tx0 = int(math.floor((vis.minx - ox) / cell)) - 1
+            tx1 = int(math.floor((vis.maxx - ox) / cell)) + 1
+            ty0 = int(math.floor((vis.miny - oy) / cell)) - 1
+            ty1 = int(math.floor((vis.maxy - oy) / cell)) + 1
+            if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 4096:  # vista absurda
+                continue
+            near = []
+            for tx in range(tx0, tx1 + 1):
+                for ty in range(ty0, ty1 + 1):
+                    if (rank, tx, ty) not in groups:
+                        continue
+                    dx = (tx + 0.5) * cell - cx
+                    dy = (ty + 0.5) * cell - cy
+                    near.append((dx * dx + dy * dy, (rank, tx, ty)))
+            near.sort(key=lambda item: item[0])
+            keys.extend(k for _, k in near)
+        return keys
 
     def _transform(self, vp) -> QTransform:
         """Local -> tela. Os numeros que chegam ao Qt sao pequenos; ver o topo."""
@@ -621,7 +647,7 @@ class DisplayList:
 
     def _draw_cell_step(self, painter, vp, level, key, visible, dark, deadline) -> bool:
         """Constroi o tile dentro do orcamento e, quando pronto, desenha."""
-        cell = self._cell(level, key[0], key[1], deadline)
+        cell = self._cell(level, key, deadline)
         if cell.pending:
             return False  # a construcao continua na proxima fatia de tempo
 
@@ -663,12 +689,12 @@ class DisplayList:
 
     # ---------------- construcao dos tiles ----------------
 
-    def _cell(self, level: int, tx, ty, deadline: float | None = None) -> _Cell:
+    def _cell(self, level: int, tile, deadline: float | None = None) -> _Cell:
         """Tile pronto para desenho, ou parcialmente construido se o tempo acabou."""
-        key = (level, tx, ty)
+        key = (level, tile)
         cell = self._cells.get(key)
         if cell is None:
-            cell = _Cell(self._members(level, tx, ty))
+            cell = _Cell(self._members(level, tile))
             self._cells[key] = cell
             self._order.append(key)
         else:
@@ -691,37 +717,63 @@ class DisplayList:
                 break
             self._forget(victim)
 
-    def _bucket_arrays(self, level: int):
-        """Indices de tile e mascara de vetor para a oitava, calculados uma vez."""
+    def _buckets_for(self, level: int):
+        """Entidades agrupadas por tile, em classes de tamanho.
+
+        Uma grade so nao serve: o tile precisa ser pequeno para o zoom fundo
+        carregar pouca coisa, e grande para uma curva de nivel de 300 m caber
+        dentro dele. Mandar as grandes para um balde unico resolvia o primeiro
+        problema e criava outro -- o balde acabava desenhado em toda vista.
+
+        Entao cada entidade entra na grade cuja celula a comporta: classe 0 usa a
+        celula do nivel, classe r usa uma celula 2^r vezes maior. Toda entidade
+        fica numa grade recortavel, e nenhuma vista carrega o que esta longe.
+        """
         if self._buckets is not None and self._buckets[0] == level:
-            return self._buckets[1:]
+            return self._buckets[1], self._buckets[2]
+
         ox, oy = self._origin
-        ts = self._tile_size(level)
+        base = self._tile_size(level)
         thr = self._threshold(level)
         n = self._high
         bb = self._bbox[:n]
+        size = self._size[:n]
         with np.errstate(invalid="ignore"):
             cx = (bb[:, 0] + bb[:, 2]) * 0.5 - ox
             cy = (bb[:, 1] + bb[:, 3]) * 0.5 - oy
-            big = (self._flags[:n] & _GEOMETRY).astype(bool) & (self._size[:n] >= thr)
-            big &= np.isfinite(cx) & np.isfinite(cy)
-            tx = np.where(big, np.floor(np.nan_to_num(cx) / ts), 0).astype(np.int64)
-            ty = np.where(big, np.floor(np.nan_to_num(cy) / ts), 0).astype(np.int64)
-        self._buckets = (level, tx, ty, big)
-        return tx, ty, big
+            keep = (self._flags[:n] & _GEOMETRY).astype(bool) & (size >= thr)
+            keep &= np.isfinite(cx) & np.isfinite(cy)
+            idx = np.flatnonzero(keep)
+            if idx.size == 0:
+                self._buckets = (level, {}, ())
+                return {}, ()
+            ratio = np.maximum(size[idx] / base, 1.0)
+            rank = np.ceil(np.log2(ratio)).astype(np.int64)
+            np.clip(rank, 0, MAX_RANK, out=rank)
+            cell = base * (2.0**rank)
+            tx = np.floor(cx[idx] / cell).astype(np.int64)
+            ty = np.floor(cy[idx] / cell).astype(np.int64)
 
-    def _members(self, level: int, tx, ty) -> list[int]:
+        # Uma ordenacao agrupa tudo; sem ela seria uma varredura por tile.
+        key = (rank << 48) + (tx << 24) + (ty + (1 << 23))
+        order = np.argsort(key, kind="stable")
+        key, members = key[order], idx[order]
+        rank, tx, ty = rank[order], tx[order], ty[order]
+        cuts = np.flatnonzero(key[1:] != key[:-1]) + 1
+        starts = np.concatenate(([0], cuts))
+        stops = np.concatenate((cuts, [key.size]))
+        groups: dict[tuple[int, int, int], list[int]] = {}
+        for a, b in zip(starts.tolist(), stops.tolist(), strict=True):
+            groups[(int(rank[a]), int(tx[a]), int(ty[a]))] = members[a:b].tolist()
+        ranks = tuple(sorted({int(r) for r in np.unique(rank)}))
+
+        self._buckets = (level, groups, ranks)
+        return groups, ranks
+
+    def _members(self, level: int, key) -> list[int]:
         """Entidades que pertencem ao tile nesta oitava."""
-        tx_all, ty_all, big = self._bucket_arrays(level)
-        ts = self._tile_size(level)
-        size = self._size[: self._high]
-        if tx is None:
-            # Uma entidade maior que o proprio tile nao cabe na grade: vai para o
-            # balde dos grandes, desenhado sempre. Sao poucas, por definicao.
-            sel = np.flatnonzero(big & (size > ts))
-        else:
-            sel = np.flatnonzero(big & (size <= ts) & (tx_all == tx) & (ty_all == ty))
-        return sel.tolist()
+        groups, _ = self._buckets_for(level)
+        return list(groups.get(key, ()))
 
     def _bake_pending(self, cell: _Cell, level: int, deadline: float | None) -> None:
         """Assa a fila do tile ate o prazo. O que sobrar fica para a proxima."""
@@ -731,12 +783,17 @@ class DisplayList:
         acis = self._aci
         pending = cell.pending
         done = 0
+        upw = 2.0**level  # unidades do mundo por pixel nesta oitava
+        sizes = self._size
         for i in pending:
             entity = self._ents[i]
             done += 1
             if entity is not None and entity.is_alive:
                 before = cell.verts
-                self._bake(cell, entity, sagitta, ox, oy, int(layers[i]), int(acis[i]))
+                self._bake(
+                    cell, entity, sagitta, ox, oy, int(layers[i]), int(acis[i]),
+                    float(sizes[i]) / upw,
+                )
                 self._verts += cell.verts - before
             # Conferir o relogio a cada entidade seria mais caro que assar uma:
             # a granularidade de 64 mantem o desvio do orcamento abaixo de 1 ms.
@@ -745,15 +802,25 @@ class DisplayList:
         del pending[:done]
 
     def _bake(self, cell: _Cell, entity, sagitta: float, ox: float, oy: float,
-              layer: int, aci: int) -> None:
-        if entity.dxftype() == "HATCH":
-            self._bake_hatch(cell, entity, sagitta, ox, oy, layer, aci)
+              layer: int, aci: int, size_px: float) -> None:
+        """Assa a entidade no tile, no detalhe que a escala do nivel comporta."""
+        t = entity.dxftype()
+        if t == "HATCH":
+            self._bake_hatch(cell, entity, sagitta, ox, oy, layer, aci, size_px)
             return
         key = (layer, aci, 255)
+        if t == "INSERT" and size_px < BLOCK_DETAIL_MIN_PX:
+            # O simbolo do bloco nao se le neste tamanho: uma cruz do tamanho
+            # dele diz a mesma coisa por dois segmentos em vez de dezenas.
+            self._bake_mark(cell.stroke(key), entity, ox, oy)
+            cell.verts += 4
+            return
         path = None
         for poly in entity_point_lists(entity, sagitta, expand_blocks=True):
             if len(poly) < 2:
                 continue
+            if len(poly) > DECIMATE_MIN_VERTS:
+                poly = decimate(poly, sagitta)
             if path is None:
                 path = cell.stroke(key)
             path.moveTo(poly[0][0] - ox, poly[0][1] - oy)
@@ -761,19 +828,43 @@ class DisplayList:
                 path.lineTo(x - ox, y - oy)
             cell.verts += len(poly)
 
+    def _bake_mark(self, path: QPainterPath, entity, ox: float, oy: float) -> None:
+        """Cruz do tamanho da entidade, no lugar do desenho dela."""
+        i = self._slot.get(entity.dxf.get("handle"))
+        if i is None:
+            return
+        minx, miny, maxx, maxy = self._bbox[i]
+        cx, cy = (minx + maxx) * 0.5 - ox, (miny + maxy) * 0.5 - oy
+        r = max(maxx - minx, maxy - miny) * 0.5
+        path.moveTo(cx - r, cy)
+        path.lineTo(cx + r, cy)
+        path.moveTo(cx, cy - r)
+        path.lineTo(cx, cy + r)
+
     def _bake_hatch(self, cell: _Cell, hatch, sagitta: float, ox: float, oy: float,
-                    layer: int, aci: int) -> None:
+                    layer: int, aci: int, size_px: float) -> None:
         try:
             alpha = int(round(255 * (1.0 - float(hatch.transparency))))
         except (TypeError, ValueError):
             alpha = 255
-        key = (layer, aci, max(25, min(alpha, 255)))
+        alpha = max(25, min(alpha, 255))
+        solid = bool(hatch.dxf.get("solid_fill", 0))
 
-        if bool(hatch.dxf.get("solid_fill", 0)):
+        # Um padrao de hachura numa area pequena na tela nao mostra padrao
+        # nenhum: mostra uma mancha. Desenhar a mancha custa um poligono; o
+        # padrao custa milhares de segmentos para o mesmo resultado visual.
+        if not solid and size_px < HATCH_PATTERN_MIN_PX:
+            solid = True
+            alpha = min(alpha, HATCH_SOLID_ALPHA)
+
+        key = (layer, aci, alpha)
+        if solid:
             path = cell.fill(key)
             for poly in entity_point_lists(hatch, sagitta):
                 if len(poly) < 3:
                     continue
+                if len(poly) > DECIMATE_MIN_VERTS:
+                    poly = decimate(poly, sagitta)
                 path.moveTo(poly[0][0] - ox, poly[0][1] - oy)
                 for x, y in poly[1:]:
                     path.lineTo(x - ox, y - oy)
