@@ -9,6 +9,7 @@ continuar achando o mesmo ponto mesmo com o orcamento de candidatos.
 
 import math
 import os
+import random
 import time
 
 import pytest
@@ -302,6 +303,89 @@ def test_partial_rebuild_never_reaches_the_planner():
     assert len(display._slot) == 2000
 
 
+# ---------------- ponteiro ----------------
+
+
+def _move(canvas, x, y):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    canvas.mouseMoveEvent(
+        QMouseEvent(
+            QMouseEvent.MouseMove, QPointF(x, y), QPointF(x, y),
+            Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+        )
+    )
+
+
+def test_mouse_moves_are_coalesced(scene, monkeypatch):
+    """Uma rajada de eventos resolve o snap uma vez, nao uma vez por evento."""
+    ctx, canvas = scene
+    calls = []
+    real = ctx.snap.snap
+    monkeypatch.setattr(ctx.snap, "snap", lambda *a, **k: calls.append(1) or real(*a, **k))
+
+    for i in range(10):
+        _move(canvas, 100 + i, 100 + i)
+    assert calls == [], "o trabalho deveria estar adiado"
+    canvas._resolve_pointer()
+    assert len(calls) == 1
+    # e a posicao usada e a ultima da rajada
+    assert canvas._cursor_screen.x() == 109
+
+    # posicao repetida nao refaz trabalho nenhum
+    _move(canvas, 109, 109)
+    canvas._resolve_pointer()
+    assert len(calls) == 1
+
+    # mas mudar a vista sim: o raio de captura depende do zoom
+    ctx.viewport.set_scale(ctx.viewport.scale * 2)
+    canvas._emit_view_changed()
+    _move(canvas, 109, 109)
+    canvas._resolve_pointer()
+    assert len(calls) == 2
+
+
+def test_click_uses_a_fresh_snap(scene):
+    """Clicar antes de o trabalho adiado rodar nao pode usar o ponto antigo."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    ctx, canvas = scene
+    _move(canvas, 50, 50)
+    canvas._resolve_pointer()
+    first = canvas.effective_point()
+
+    _move(canvas, 300, 200)
+    assert canvas._pointer_dirty, "o movimento novo ainda nao foi resolvido"
+    canvas.mousePressEvent(
+        QMouseEvent(
+            QMouseEvent.MouseButtonPress, QPointF(300, 200), QPointF(300, 200),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+        )
+    )
+    assert not canvas._pointer_dirty
+    assert canvas.effective_point() != first
+
+
+def test_selection_shapes_are_cached_across_mouse_moves(scene):
+    ctx, canvas = scene
+    ctx.selection.set(list(ctx.doc.msp))
+    outlines, _ = canvas._selection_shapes()
+    assert outlines
+    again, _ = canvas._selection_shapes()
+    assert again is outlines, "o contorno foi refeito sem nada ter mudado"
+
+    ctx.selection.clear()
+    empty, _ = canvas._selection_shapes()
+    assert empty is not outlines and not empty
+
+    ctx.selection.set(list(ctx.doc.msp))
+    ctx.viewport.pan_screen(40, 0)
+    moved, _ = canvas._selection_shapes()
+    assert moved is not outlines, "mudar a vista tem de refazer o contorno"
+
+
 # ---------------- precisao do rebase ----------------
 
 
@@ -336,6 +420,42 @@ def test_snap_still_finds_the_endpoint_under_the_candidate_budget():
     assert result is not None
     assert result.kind == "end"
     assert result.point.distance_to(Vec2(E, N)) < 1e-9
+
+
+def test_pick_at_matches_an_exhaustive_scan():
+    """A saida antecipada por bbox nao pode mudar quem e a entidade mais proxima."""
+    from engecad.core.picking import entity_distance, pick_at
+
+    doc = Document.new()
+    random.seed(11)
+    for _ in range(600):
+        x = E + random.uniform(0, 60)
+        y = N + random.uniform(0, 40)
+        doc.msp.add_line((x, y), (x + random.uniform(-8, 8), y + random.uniform(-8, 8)))
+    doc.rebuild_index()
+
+    for _ in range(40):
+        p = Vec2(E + random.uniform(0, 60), N + random.uniform(0, 40))
+        tol = 1.5
+        got = pick_at(doc, p, tol)
+        best, best_d = None, float("inf")
+        for e in doc.query_point(p, tol):
+            d = entity_distance(e, p, tol * 0.1)
+            if d <= tol and d < best_d:
+                best, best_d = e, d
+        assert got is best
+
+
+def test_layer_state_cache_follows_visibility():
+    doc = Document.new()
+    doc.ensure_layer("MURO", 1)
+    assert doc.layer_is_visible("MURO")
+    doc.set_layer_visible("MURO", False)
+    assert not doc.layer_is_visible("MURO")
+    doc.set_layer_visible("MURO", True)
+    assert doc.layer_is_visible("MURO")
+    doc.set_layer_color("MURO", 5)
+    assert doc.layer_color("MURO") == 5
 
 
 def test_snap_point_cache_follows_edits():

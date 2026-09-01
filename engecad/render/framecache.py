@@ -188,8 +188,22 @@ class FrameCache:
         x0, y0 = vp.world_to_screen_xy(box.minx, box.maxy)
         x1, y1 = vp.world_to_screen_xy(box.maxx, box.miny)
         if self.scale == vp.scale:
-            # Mesma escala: um blit deslocado, sem reamostragem.
-            painter.drawPixmap(QPointF(x0, y0), self.pixmap)
+            # Mesma escala: um blit deslocado, sem reamostragem. So o pedaco que
+            # cabe na janela -- o pixmap e 2.25x maior que ela por causa da folga
+            # do pan, e copia-lo inteiro a cada movimento do mouse era o maior
+            # custo isolado de um quadro ocioso.
+            dpr = self.pixmap.devicePixelRatio()
+            sx = max(0.0, -x0)
+            sy = max(0.0, -y0)
+            w = min(self._logical[0] - sx, vp.width - max(x0, 0.0))
+            h = min(self._logical[1] - sy, vp.height - max(y0, 0.0))
+            if w <= 0 or h <= 0:
+                return False
+            painter.drawPixmap(
+                QPointF(x0 + sx, y0 + sy),
+                self.pixmap,
+                QRectF(sx * dpr, sy * dpr, w * dpr, h * dpr),
+            )
             return True
         painter.drawPixmap(
             QRectF(x0, y0, x1 - x0, y1 - y0), self.pixmap, QRectF(self.pixmap.rect())

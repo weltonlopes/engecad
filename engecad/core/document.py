@@ -189,6 +189,7 @@ class Document:
         self.geometry_revision = 0
         self._dirty_handles: set[str] = set()
         self._dirty_all = True
+        self._layer_cache: dict[str, tuple[bool, bool, int]] = {}
         self._modified = False
         self._current_layer = "0"
         self.changed: list[Callable[[], None]] = []
@@ -281,41 +282,56 @@ class Document:
     def ensure_layer(self, name: str, color: int = ACI_WHITE):
         if name in self.drawing.layers:
             return self.drawing.layers.get(name)
+        self.invalidate_layer_cache()
         return self.drawing.layers.add(name, color=color)
 
     def layer_names(self) -> list[str]:
         return sorted(layer.dxf.name for layer in self.drawing.layers)
 
+    def _layer_state(self, name: str) -> tuple[bool, bool, int]:
+        """(visivel, travada, cor) com cache.
+
+        Snap e picking consultam a camada de CADA candidato, a cada movimento do
+        mouse. Ir ate a tabela do ezdxf toda vez custava 1.5 ms por movimento num
+        desenho grande -- mais que o proprio teste de acerto. O cache e invalidado
+        junto com qualquer mudanca de camada.
+        """
+        hit = self._layer_cache.get(name)
+        if hit is None:
+            try:
+                layer = self.drawing.layers.get(name)
+                hit = (layer.is_on() and not layer.is_frozen(), bool(layer.is_locked()),
+                       int(layer.dxf.color))
+            except Exception:
+                hit = (True, False, ACI_WHITE)
+            self._layer_cache[name] = hit
+        return hit
+
+    def invalidate_layer_cache(self) -> None:
+        self._layer_cache.clear()
+
     def layer_is_visible(self, name: str) -> bool:
-        try:
-            layer = self.drawing.layers.get(name)
-        except Exception:
-            return True
-        return layer.is_on() and not layer.is_frozen()
+        return self._layer_state(name)[0]
+
+    def layer_is_locked(self, name: str) -> bool:
+        return self._layer_state(name)[1]
+
+    def layer_color(self, name: str) -> int:
+        return self._layer_state(name)[2]
 
     def set_layer_visible(self, name: str, visible: bool) -> None:
         layer = self.drawing.layers.get(name)
         layer.on() if visible else layer.off()
+        self.invalidate_layer_cache()
         self._touch()
-
-    def layer_color(self, name: str) -> int:
-        try:
-            return int(self.drawing.layers.get(name).dxf.color)
-        except Exception:
-            return ACI_WHITE
 
     def set_layer_color(self, name: str, aci: int) -> None:
         self.drawing.layers.get(name).dxf.color = int(aci)
+        self.invalidate_layer_cache()
         # A display list agrupa a geometria por cor ja resolvida: mudar a cor da
         # camada obriga a reagrupar.
         self.invalidate_all_geometry()
         self._touch()
-
-    def layer_is_locked(self, name: str) -> bool:
-        try:
-            return bool(self.drawing.layers.get(name).is_locked())
-        except Exception:
-            return False
 
     # ---------------- indice espacial ----------------
 
@@ -329,6 +345,7 @@ class Document:
             self._by_handle[h] = e
             items.append((h, entity_bbox(e)))
         self.index.build(items)
+        self.invalidate_layer_cache()
         invalidate_primitives()
         self._dirty_all = True
         self._dirty_handles.clear()
@@ -346,6 +363,7 @@ class Document:
 
     def invalidate_all_geometry(self) -> None:
         """Forca a reconstrucao completa dos caches de desenho."""
+        self.invalidate_layer_cache()
         invalidate_primitives()
         self._dirty_all = True
         self.geometry_revision += 1

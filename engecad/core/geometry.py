@@ -129,8 +129,9 @@ class BBox:
         return BBox(self.minx - d, self.miny - d, self.maxx + d, self.maxy + d)
 
     def intersects(self, o: BBox) -> bool:
-        if self.is_empty or o.is_empty:
-            return False
+        # Chamado centenas de vezes por movimento do mouse, pelo indice espacial.
+        # A bbox vazia tem minx=+inf e maxx=-inf, entao as comparacoes abaixo ja
+        # a rejeitam: nao vale pagar duas chamadas de propriedade para checar.
         return not (
             o.minx > self.maxx or o.maxx < self.minx or o.miny > self.maxy or o.maxy < self.miny
         )

@@ -8,6 +8,7 @@ espacial -- nunca varremos o desenho inteiro a cada movimento do mouse.
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass
 
 from ..core.entities import entity_polylines, entity_snap_points
@@ -51,8 +52,8 @@ DEFAULT_ENABLED = {"end", "mid", "center", "quad", "node", "intersection", "near
 # movimento num desenho de 200 mil. Ficamos com os mais proximos do cursor, e as
 # buscas caras (nearest e intersecao percorrem toda a geometria achatada) so
 # rodam quando ha poucos candidatos.
-MAX_CANDIDATES = 48
-MAX_FOR_GEOMETRY = 24
+MAX_CANDIDATES = 24
+MAX_FOR_GEOMETRY = 16
 
 
 @dataclass(frozen=True)
@@ -96,7 +97,7 @@ class SnapEngine:
         return hit
 
     def _candidates(self, world: Vec2, radius: float, exclude) -> list:
-        """Entidades elegiveis, das mais proximas do cursor para as mais longe."""
+        """(piso da distancia, entidade), das mais proximas para as mais longe."""
         doc = self.doc
         boxes = doc.index._boxes
         out = []
@@ -111,11 +112,10 @@ class SnapEngine:
                 continue
             dx = max(box.minx - world.x, 0.0, world.x - box.maxx)
             dy = max(box.miny - world.y, 0.0, world.y - box.maxy)
-            out.append((dx * dx + dy * dy, e))
-        if len(out) > MAX_CANDIDATES:
-            out.sort(key=lambda item: item[0])
-            del out[MAX_CANDIDATES:]
-        return [e for _, e in out]
+            out.append((math.hypot(dx, dy), e))
+        out.sort(key=lambda item: item[0])
+        del out[MAX_CANDIDATES:]
+        return out
 
     def snap(self, world: Vec2, viewport, exclude=()) -> SnapResult | None:
         """Melhor ponto de snap perto de `world`, ou None."""
@@ -125,7 +125,7 @@ class SnapEngine:
         if radius <= 0:
             return None
 
-        entities = self._candidates(world, radius, exclude)
+        ranked = self._candidates(world, radius, exclude)
 
         best: tuple[int, float, SnapResult] | None = None
 
@@ -140,10 +140,16 @@ class SnapEngine:
             if best is None or key < (best[0], best[1]):
                 best = (key[0], key[1], SnapResult(p, kind, source))
 
-        for e in entities:
+        top = PRIORITY["end"]
+        for floor, e in ranked:
+            # Ja temos uma extremidade mais perto que o piso deste candidato:
+            # nada dele pode ganhar, nem em prioridade nem em distancia.
+            if best is not None and best[0] == top and floor > best[1]:
+                break
             for kind, p in self._snap_points(e):
                 consider(kind, p, e)
 
+        entities = [e for _, e in ranked]
         # Nearest e intersecao percorrem a geometria achatada de cada candidato:
         # so valem a pena quando o cursor esta sobre poucas entidades.
         geometry_ok = len(entities) <= MAX_FOR_GEOMETRY

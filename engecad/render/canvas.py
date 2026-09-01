@@ -47,6 +47,22 @@ MAX_OUTLINES = 2_000  # contornos de selecao/realce desenhados por quadro
 TEXT_TYPES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
 
 
+class _PointerAt:
+    """Posicao do cursor com a cara de um evento de mouse.
+
+    O tratamento de um movimento e adiado ate o fim da rajada de eventos, e um
+    QMouseEvent nao sobrevive a isso. As ferramentas so consomem `position()`.
+    """
+
+    __slots__ = ("_pos",)
+
+    def __init__(self, pos):
+        self._pos = pos
+
+    def position(self):
+        return self._pos
+
+
 class CadCanvas(QWidget):
     coordinateMoved = Signal(object)  # Vec2 no CRS do projeto
     snapChanged = Signal(object)  # SnapResult | None
@@ -69,6 +85,9 @@ class CadCanvas(QWidget):
         self._display = DisplayList(ctx.doc)
         self._frame = FrameCache()
         self._interactive = False
+        self._sel_key: tuple | None = None
+        self._sel_outlines: list = []
+        self._sel_grips: list = []
         self._refine = QTimer(self)
         self._refine.setSingleShot(True)
         self._refine.timeout.connect(self._finish_gesture)
@@ -77,6 +96,13 @@ class CadCanvas(QWidget):
         self._advance.setSingleShot(True)
         self._advance.setInterval(0)
         self._advance.timeout.connect(self.update)
+        # Junta a rajada de eventos de mouse numa resolucao so.
+        self._pointer_dirty = False
+        self._pointer_at: tuple[float, float] | None = None
+        self._pointer = QTimer(self)
+        self._pointer.setSingleShot(True)
+        self._pointer.setInterval(0)
+        self._pointer.timeout.connect(self._resolve_pointer)
         ctx.documentReplaced.connect(self._on_document_replaced)
         # Qualquer mutacao do documento (geometria, cor ou visibilidade de
         # camada) invalida o quadro guardado; a display list so reconstroi os
@@ -133,6 +159,31 @@ class CadCanvas(QWidget):
         self._frame.invalidate()
         super().resizeEvent(ev)
 
+    # ---------------- ponteiro ----------------
+
+    def _resolve_pointer(self) -> None:
+        """Resolve snap, realce e previa da ferramenta na posicao mais recente."""
+        self._pointer.stop()
+        if not self._pointer_dirty or self._cursor_world is None:
+            return
+        self._pointer_dirty = False
+        # Um mouse manda posicoes repetidas e sub-pixel; nenhuma delas muda o
+        # snap, o realce nem a mira desenhada.
+        pos = self._cursor_screen
+        last = self._pointer_at
+        if last is not None and pos is not None:
+            if abs(pos.x() - last[0]) < 1.0 and abs(pos.y() - last[1]) < 1.0:
+                return
+        self._pointer_at = (pos.x(), pos.y()) if pos is not None else None
+        tool = self.ctx.tool
+        exclude = tool.snap_exclude() if tool is not None else ()
+        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp, exclude=exclude)
+        self.snapChanged.emit(self._snap)
+        self.coordinateMoved.emit(self.effective_point())
+        if tool is not None:
+            tool.on_mouse_move(self.effective_point(), _PointerAt(self._cursor_screen))
+        self.update()
+
     # ---------------- mouse ----------------
 
     def mouseMoveEvent(self, ev):
@@ -148,15 +199,13 @@ class CadCanvas(QWidget):
 
         self._cursor_screen = pos
         self._cursor_world = self.vp.screen_to_world(pos.x(), pos.y())
-        tool = self.ctx.tool
-        exclude = tool.snap_exclude() if tool is not None else ()
-        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp, exclude=exclude)
-        self.snapChanged.emit(self._snap)
-        self.coordinateMoved.emit(self.effective_point())
-
-        if tool is not None:
-            tool.on_mouse_move(self.effective_point(), ev)
-        self.update()
+        # Um mouse reporta ate mil posicoes por segundo; resolver snap e realce
+        # em cada uma custa mais do que o intervalo entre elas, e a fila cresce
+        # sem parar -- e a sensacao de arrasto. Aqui so anotamos onde o cursor
+        # esta; o trabalho de verdade acontece uma vez por volta do laco de
+        # eventos, ja com a ultima posicao.
+        self._pointer_dirty = True
+        self._pointer.start(0)
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.MiddleButton:
@@ -164,6 +213,8 @@ class CadCanvas(QWidget):
             self._pan_anchor = ev.position()
             self.setCursor(Qt.ClosedHandCursor)
             return
+        # Um clique nao pode usar um snap de uma posicao anterior.
+        self._resolve_pointer()
         p = self.effective_point()
         if p is None:
             return
@@ -185,6 +236,7 @@ class CadCanvas(QWidget):
                 self._finish_gesture()
             return
         if ev.button() == Qt.LeftButton:
+            self._resolve_pointer()
             tool = self.ctx.tool
             p = self.effective_point()
             if tool is not None and p is not None:
@@ -198,12 +250,13 @@ class CadCanvas(QWidget):
         factor = ZOOM_STEP if delta > 0 else 1 / ZOOM_STEP
         pos = ev.position()
         self.vp.zoom_at_screen(pos.x(), pos.y(), factor)
+        self._cursor_screen = pos
         self._cursor_world = self.vp.screen_to_world(pos.x(), pos.y())
         self._interactive = True
-        tool = self.ctx.tool
-        exclude = tool.snap_exclude() if tool is not None else ()
-        self._snap = self.ctx.snap.snap(self._cursor_world, self.vp, exclude=exclude)
-        self.coordinateMoved.emit(self.effective_point())
+        # O raio de captura muda com o zoom: o snap tem de ser refeito, mas pode
+        # esperar o fim da rajada da roda como qualquer movimento.
+        self._pointer_dirty = True
+        self._pointer.start(0)
         self._emit_view_changed()
         self.update()
 
@@ -231,12 +284,17 @@ class CadCanvas(QWidget):
         super().keyPressEvent(ev)
 
     def leaveEvent(self, ev):
+        self._pointer.stop()
+        self._pointer_dirty = False
         self._cursor_screen = None
         self._snap = None
         self.update()
         super().leaveEvent(ev)
 
     def _emit_view_changed(self):
+        # Zoom e pan mudam o raio de captura e o que esta sob o cursor, mesmo com
+        # o mouse parado: o filtro de posicao repetida nao vale mais.
+        self._pointer_at = None
         self.viewChanged.emit()
         self.ctx.viewChanged.emit()
 
@@ -246,7 +304,7 @@ class CadCanvas(QWidget):
         painter = QPainter(self)
         self._draw_scene(painter)
 
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.Antialiasing, False)
         self._paint_hover(painter)
         self._paint_selection(painter)
 
@@ -483,51 +541,116 @@ class CadCanvas(QWidget):
         painter.setPen(pen)
         self._entity_outline(painter, e, self.vp.flatten_tolerance(0.5))
 
-    def _paint_selection(self, painter):
+    def _selection_key(self) -> tuple:
+        vp = self.vp
         sel = self.ctx.selection
-        if sel is None or not len(sel):
+        return (
+            vp.center.x,
+            vp.center.y,
+            vp.scale,
+            vp.width,
+            vp.height,
+            sel.revision if sel is not None else 0,
+            self.doc.geometry_revision,
+            self.ctx.tool,  # trocar de ferramenta muda quais grips aparecem
+        )
+
+    def _selection_shapes(self) -> tuple[list, list]:
+        """Contornos e grips da selecao, ja em coordenadas de tela.
+
+        Nada disso muda quando o mouse anda -- so quando a selecao, a vista ou a
+        geometria mudam. Refazer o achatamento a cada movimento fazia uma selecao
+        de 200 entidades custar 6 ms por evento, e os eventos chegam mais rapido
+        do que isso.
+        """
+        key = self._selection_key()
+        if key == self._sel_key:
+            return self._sel_outlines, self._sel_grips
+
+        vp = self.vp
+        sel = self.ctx.selection
+        outlines: list = []
+        if sel is not None and len(sel._items):
+            tol = vp.flatten_tolerance(0.4)
+            vis = vp.visible_bbox()
+            boxes = self.doc.index._boxes
+            for e in sel:
+                if len(outlines) >= MAX_OUTLINES:
+                    break  # selecao enorme: o tracejado nao pode custar o quadro
+                box = boxes.get(e.dxf.get("handle"))
+                if box is not None and not box.intersects(vis):
+                    continue
+                outlines.extend(self._outline_shapes(e, tol))
+
+        tool = self.ctx.tool
+        grips: list = []
+        if tool is not None and tool.is_idle:
+            for g in tool.visible_grips():
+                x, y = vp.world_to_screen(g.point)
+                grips.append((g, x, y))
+
+        self._sel_key = key
+        self._sel_outlines = outlines
+        self._sel_grips = grips
+        return outlines, grips
+
+    def _outline_shapes(self, entity, tol) -> list:
+        """Formas de tela que contornam a entidade: poligonais ou um quadradinho."""
+        vp = self.vp
+        if entity.dxftype() in POINT_LIKE:
+            p = entity_insert_point(entity)
+            if p is None:
+                return []
+            x, y = vp.world_to_screen(p)
+            return [QRectF(x - 5, y - 5, 10, 10)]
+        out = []
+        for poly in entity_polylines(entity, tol):
+            if len(poly) >= 2:
+                out.append(QPolygonF([QPointF(*vp.world_to_screen(p)) for p in poly]))
+        return out
+
+    def _paint_selection(self, painter):
+        outlines, _ = self._selection_shapes()
+        if not outlines:
             return
         pen = QPen(self.theme.q("selection"), 1.8)
         pen.setStyle(Qt.DashLine)
         pen.setCosmetic(True)
         painter.setPen(pen)
-        tol = self.vp.flatten_tolerance(0.4)
-        vis = self.vp.visible_bbox()
-        drawn = 0
-        for e in sel:
-            if drawn >= MAX_OUTLINES:
-                break  # selecao enorme: o contorno tracejado nao pode custar o quadro
-            box = self.doc.index._boxes.get(e.dxf.get("handle"))
-            if box is not None and not box.intersects(vis):
-                continue
-            self._entity_outline(painter, e, tol)
-            drawn += 1
+        for shape in outlines:
+            if isinstance(shape, QRectF):
+                painter.drawRect(shape)
+            else:
+                painter.drawPolyline(shape)
 
     def _paint_grips(self, painter):
         tool = self.ctx.tool
         if tool is None or not tool.is_idle:
             return
-        grips = tool.visible_grips()
+        _, grips = self._selection_shapes()
         if not grips:
             return
         hovered = getattr(tool, "hover_grip", None)
-        vp = self.vp
         base = QColor(self.theme.selection)
         hot = QColor("#ff8c1a")
         pen = QPen(base.darker(150), 1)
         pen.setCosmetic(True)
-        for g in grips:
-            x, y = vp.world_to_screen(g.point)
-            is_hot = (
+        painter.setPen(pen)
+        painter.setBrush(QBrush(base))
+        hot_rect = None
+        for g, x, y in grips:
+            if (
                 hovered is not None
                 and hovered.entity is g.entity
                 and hovered.kind == g.kind
                 and hovered.index == g.index
-            )
-            s = 6 if is_hot else 4.5
-            painter.setPen(pen)
-            painter.setBrush(QBrush(hot if is_hot else base))
-            painter.drawRect(QRectF(x - s, y - s, 2 * s, 2 * s))
+            ):
+                hot_rect = QRectF(x - 6, y - 6, 12, 12)
+                continue
+            painter.drawRect(QRectF(x - 4.5, y - 4.5, 9, 9))
+        if hot_rect is not None:
+            painter.setBrush(QBrush(hot))
+            painter.drawRect(hot_rect)
         painter.setBrush(Qt.NoBrush)
 
     def _paint_vertex_focus(self, painter):
