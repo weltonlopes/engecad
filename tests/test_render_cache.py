@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from ezdxf import bbox as ezbbox  # noqa: E402
 from ezdxf.path import make_path  # noqa: E402
-from PySide6.QtGui import QImage  # noqa: E402
+from PySide6.QtGui import QImage, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from engecad.context import AppContext  # noqa: E402
@@ -107,11 +107,15 @@ def test_fast_flattening_matches_generic_for_polylines():
     assert fast[0] == pytest.approx(fast[-1]), "o contorno fechado tem de voltar ao inicio"
 
 
-def test_fast_flattening_defers_to_generic_when_not_trivial():
-    """Bulge e extrusao fora do plano tem de cair no caminho de referencia."""
+def test_fast_flattening_handles_bulge_and_defers_non_planar_geometry():
+    """Bulge usa o caminho direto; extrusao fora do plano fica na referencia."""
+    from shapely.geometry import LineString
+
     doc = Document.new()
     bulged = doc.msp.add_lwpolyline([(E, N, 0.0), (E + 10, N, 1.0)], format="xyb")
-    assert _fast_points(bulged, "LWPOLYLINE", 0.01) is None
+    fast = _fast_points(bulged, "LWPOLYLINE", 0.01)[0]
+    ref = [(v.x, v.y) for v in make_path(bulged).flattening(0.01)]
+    assert LineString(fast).hausdorff_distance(LineString(ref)) <= 0.011
     tilted = doc.msp.add_line((E, N), (E + 1, N + 1), dxfattribs={"extrusion": (0, 0, -1)})
     assert _fast_points(tilted, "LINE", 0.01) is None
     # mas continuam produzindo geometria pelo caminho generico
@@ -130,6 +134,9 @@ def test_fast_flattening_defers_to_generic_when_not_trivial():
         lambda m: m.add_arc((E, N), 10, 300, 60),
         lambda m: m.add_arc((E, N), 10, 10, 80),
         lambda m: m.add_lwpolyline([(E, N), (E + 10, N), (E + 10, N + 5)], close=True),
+        lambda m: m.add_lwpolyline(
+            [(E, N, 0.75), (E + 10, N, -0.25), (E + 12, N + 8, 0.0)], format="xyb"
+        ),
         lambda m: m.add_point((E + 7, N + 8)),
     ],
 )
@@ -497,10 +504,11 @@ def test_local_coordinates_stay_small_enough_for_the_rasterizer(scene):
     ox, oy = display._origin
     assert abs(E - ox) < 1e4 and abs(N - oy) < 1e4
     for cell in display._cells.values():
-        for path in cell.strokes.values():
-            box = path.boundingRect()
-            # em float32 um valor desta ordem tem erro submilimetrico
-            assert max(abs(box.left()), abs(box.top())) < 1e5
+        for chunks in cell.strokes.values():
+            for path in chunks:
+                box = path.boundingRect()
+                # em float32 um valor desta ordem tem erro submilimetrico
+                assert max(abs(box.left()), abs(box.top())) < 1e5
 
 
 # ---------------- snap sob orcamento ----------------
@@ -572,3 +580,113 @@ def test_snap_point_cache_follows_edits():
         line.dxf.end = (E + 20, N)
     hit = ctx.snap.snap(Vec2(E + 20.05, N), ctx.viewport)
     assert hit is not None and hit.point.distance_to(Vec2(E + 20, N)) < 1e-9
+
+
+def test_hierarchical_index_matches_exhaustive_queries():
+    """Entidades de portes muito diferentes nao podem exigir uma lista global."""
+    from engecad.core.spatial_index import GridIndex
+
+    random.seed(29)
+    boxes = {}
+    for i in range(1800):
+        x = random.uniform(-20_000, 20_000)
+        y = random.uniform(-20_000, 20_000)
+        size = 2.0 if i < 1500 else random.uniform(100.0, 12_000.0)
+        boxes[i] = BBox(x, y, x + size, y + size * random.uniform(0.01, 1.0))
+    index = GridIndex()
+    index.build(boxes.items())
+
+    assert not index._large
+    assert len(index._rows) > 1, "entidades grandes deveriam subir de nivel"
+    for _ in range(80):
+        x = random.uniform(-25_000, 25_000)
+        y = random.uniform(-25_000, 25_000)
+        r = random.uniform(1.0, 8_000.0)
+        query = BBox(x - r, y - r, x + r, y + r)
+        expected = {key for key, box in boxes.items() if box.intersects(query)}
+        assert index.query(query) == expected
+
+    index.remove(0)
+    boxes.pop(0)
+    replacement = BBox(-3, -4, 5, 6)
+    index.insert("novo", replacement)
+    boxes["novo"] = replacement
+    query = BBox(-10, -10, 10, 10)
+    assert index.query(query) == {key for key, box in boxes.items() if box.intersects(query)}
+
+
+def test_pointer_reuses_one_spatial_probe(scene, monkeypatch):
+    """Snap e hover do mesmo movimento fazem uma unica consulta ao documento."""
+    ctx, canvas = scene
+    calls = []
+    real = ctx.doc.index.query
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(ctx.doc.index, "query", counted)
+    canvas._pointer_at = None
+    _move(canvas, 180, 140)
+    canvas._resolve_pointer()
+    assert len(calls) == 1
+
+
+def test_snap_large_polyline_uses_vectorized_point_budget(monkeypatch):
+    """Milhares de vertices nao viram milhares de chamadas Python por movimento."""
+    doc = Document.new()
+    points = [(E + i * 0.2, N + (i % 2) * 0.02) for i in range(15_000)]
+    doc.msp.add_lwpolyline(points)
+    doc.rebuild_index()
+    ctx = AppContext(doc)
+    ctx.viewport.resize(800, 600)
+    ctx.viewport.zoom_to_bbox(BBox(E - 10, N - 10, E + 3010, N + 10))
+
+    calls = []
+    real = Vec2.distance_to
+
+    def counted(self, other):
+        calls.append(1)
+        return real(self, other)
+
+    monkeypatch.setattr(Vec2, "distance_to", counted)
+    result = ctx.snap.snap(Vec2(E + 0.01, N + 0.01), ctx.viewport)
+    assert result is not None and result.kind == "end"
+    assert result.point.distance_to(Vec2(E, N)) < 1e-9
+    assert len(calls) < 20, "a distancia deveria ser calculada por arrays, nao por vertice"
+
+
+def test_hover_outline_is_cached_until_view_changes(scene, monkeypatch):
+    ctx, canvas = scene
+    entity = next(iter(ctx.doc.msp))
+    ctx.tool.hover = entity
+    calls = []
+    real = canvas._outline_shapes
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(canvas, "_outline_shapes", counted)
+    image = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+    painter = QPainter(image)
+    canvas._paint_hover(painter)
+    canvas._paint_hover(painter)
+    assert len(calls) == 1
+    ctx.viewport.pan_screen(10, 0)
+    canvas._paint_hover(painter)
+    painter.end()
+    assert len(calls) == 2
+
+
+def test_large_polyline_is_split_into_bounded_paths():
+    from engecad.render.displaylist import MAX_PATH_VERTS
+
+    doc = Document.new()
+    points = [(E + i * 0.05, N + (i % 2) * 0.1) for i in range(25_000)]
+    entity = doc.msp.add_lwpolyline(points)
+    doc.rebuild_index()
+    cell = _bake_one(entity, doc, 0.05)
+    chunks = [path for paths in cell.strokes.values() for path in paths]
+    assert len(chunks) >= 3
+    assert max(path.elementCount() for path in chunks) <= MAX_PATH_VERTS

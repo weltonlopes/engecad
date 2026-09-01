@@ -1,25 +1,36 @@
-"""Indice espacial em grade uniforme.
+"""Indice espacial hierarquico em grades esparsas.
 
-Serve para achar candidatos a snap/selecao perto do cursor sem varrer o
-desenho inteiro a cada movimento do mouse. Grade uniforme e o suficiente
-para desenhos cadastrais (entidades de tamanho parecido, bem distribuidas);
-se um dia precisar, trocar por R-tree e local unico.
+Cada entidade entra na oitava cuja celula comporta o seu bbox. Assim um eixo de
+rodovia de dezenas de quilometros nao e copiado para milhoes de celulas e tambem
+nao vira uma excecao consultada em todo movimento do mouse. As linhas e colunas
+ocupadas ficam ordenadas sob demanda; uma consulta grande visita somente celulas
+que existem, nunca o retangulo inteiro de celulas vazias.
 """
 
 from __future__ import annotations
 
+import bisect
 import math
+import statistics
 from collections.abc import Iterable
 
 from .geometry import BBox, Vec2
 
 
 class GridIndex:
+    """Grade esparsa multinivel com insercao e remocao incrementais."""
+
     def __init__(self, cell_size: float | None = None):
+        #: Aresta da celula do nivel zero. Niveis seguintes dobram a aresta.
         self.cell_size = cell_size
-        self._cells: dict[tuple[int, int], set] = {}
+        self._cells: dict[tuple[int, int, int], set] = {}
+        self._rows: dict[int, dict[int, dict[int, set]]] = {}
         self._boxes: dict[object, BBox] = {}
-        # entidades cujo bbox cobre celulas demais: varridas sempre
+        self._levels: dict[object, int] = {}
+        self._row_keys: dict[int, list[int]] = {}
+        self._x_keys: dict[tuple[int, int], list[int]] = {}
+        # Mantido por compatibilidade com diagnosticos antigos. A grade
+        # hierarquica nao precisa mais de entidades "grandes" globais.
         self._large: set = set()
 
     def __len__(self) -> int:
@@ -27,41 +38,58 @@ class GridIndex:
 
     def clear(self) -> None:
         self._cells.clear()
+        self._rows.clear()
         self._boxes.clear()
+        self._levels.clear()
+        self._row_keys.clear()
+        self._x_keys.clear()
         self._large.clear()
 
-    def _keys_for(self, b: BBox):
-        cs = self.cell_size or 1.0
+    def _cell_size(self, level: int) -> float:
+        return (self.cell_size or 1.0) * (2.0**level)
+
+    def _level_for(self, b: BBox) -> int:
+        base = self.cell_size or 1.0
+        size = max(b.width, b.height)
+        if size <= base:
+            return 0
+        return max(0, int(math.ceil(math.log2(size / base))))
+
+    def _keys_for(self, b: BBox, level: int | None = None) -> list[tuple[int, int]]:
+        level = self._level_for(b) if level is None else level
+        cs = self._cell_size(level)
         x0, y0 = int(math.floor(b.minx / cs)), int(math.floor(b.miny / cs))
         x1, y1 = int(math.floor(b.maxx / cs)), int(math.floor(b.maxy / cs))
-        # Um bbox gigante (ex.: entidade que cruza o desenho todo) pode gerar
-        # milhoes de celulas; nesse caso vai para a lista de "grandes".
-        if (x1 - x0 + 1) * (y1 - y0 + 1) > 4096:
-            return None
         return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
     def build(self, items: Iterable[tuple[object, BBox]]) -> None:
-        """Reconstroi o indice. items = (chave, bbox)."""
+        """Reconstroi o indice. ``items`` contem pares ``(chave, bbox)``."""
         pairs = [(k, b) for k, b in items if not b.is_empty]
         self.clear()
         if not pairs:
             return
         if self.cell_size is None:
-            # celula ~ 2x o tamanho medio das entidades: poucas celulas por
-            # consulta e poucas entidades por celula.
-            avg = sum(max(b.width, b.height) for _, b in pairs) / len(pairs)
-            self.cell_size = max(avg * 2.0, 1e-6)
-        for k, b in pairs:
-            self._insert(k, b)
+            # A media era dominada por poucos eixos gigantes e deixava dezenas
+            # de milhares de objetos na mesma celula. A mediana descreve o porte
+            # da entidade comum; as grandes sobem de nivel por conta propria.
+            sizes = [max(b.width, b.height) for _, b in pairs]
+            positive = [s for s in sizes if s > 0.0]
+            typical = statistics.median(positive) if positive else 1.0
+            self.cell_size = max(typical * 2.0, 1e-6)
+        for key, box in pairs:
+            self._insert(key, box)
 
     def _insert(self, key, b: BBox) -> None:
+        level = self._level_for(b)
         self._boxes[key] = b
-        keys = self._keys_for(b)
-        if keys is None:
-            self._large.add(key)
-            return
-        for ck in keys:
-            self._cells.setdefault(ck, set()).add(key)
+        self._levels[key] = level
+        rows = self._rows.setdefault(level, {})
+        for x, y in self._keys_for(b, level):
+            cell = self._cells.setdefault((level, x, y), set())
+            cell.add(key)
+            rows.setdefault(y, {})[x] = cell
+            self._row_keys.pop(level, None)
+            self._x_keys.pop((level, y), None)
 
     def insert(self, key, b: BBox) -> None:
         if b.is_empty:
@@ -73,45 +101,67 @@ class GridIndex:
         self._insert(key, b)
 
     def remove(self, key) -> None:
-        b = self._boxes.pop(key, None)
-        if b is None:
+        b = self._boxes.get(key)
+        level = self._levels.get(key)
+        if b is None or level is None:
             return
-        self._large.discard(key)
-        keys = self._keys_for(b)
-        if keys is None:
-            return
-        for ck in keys:
-            cell = self._cells.get(ck)
-            if cell is not None:
-                cell.discard(key)
-                if not cell:
-                    del self._cells[ck]
+        rows = self._rows.get(level, {})
+        for x, y in self._keys_for(b, level):
+            cell_key = (level, x, y)
+            cell = self._cells.get(cell_key)
+            if cell is None:
+                continue
+            cell.discard(key)
+            if cell:
+                continue
+            del self._cells[cell_key]
+            row = rows.get(y)
+            if row is not None:
+                row.pop(x, None)
+                self._x_keys.pop((level, y), None)
+                if not row:
+                    rows.pop(y, None)
+                    self._row_keys.pop(level, None)
+        if not rows:
+            self._rows.pop(level, None)
+            self._row_keys.pop(level, None)
+        self._boxes.pop(key, None)
+        self._levels.pop(key, None)
+
+    def _sorted_rows(self, level: int, rows: dict[int, dict[int, set]]) -> list[int]:
+        hit = self._row_keys.get(level)
+        if hit is None:
+            hit = self._row_keys[level] = sorted(rows)
+        return hit
+
+    def _sorted_x(self, level: int, y: int, row: dict[int, set]) -> list[int]:
+        cache_key = (level, y)
+        hit = self._x_keys.get(cache_key)
+        if hit is None:
+            hit = self._x_keys[cache_key] = sorted(row)
+        return hit
 
     def query(self, b: BBox) -> set:
-        """Chaves cujo bbox pode intersectar b (pode devolver falsos positivos)."""
+        """Chaves cujo bbox intersecta ``b`` sem percorrer celulas vazias."""
         if b.is_empty or not self._boxes:
             return set()
-        cs = self.cell_size or 1.0
-        x0, y0 = int(math.floor(b.minx / cs)), int(math.floor(b.miny / cs))
-        x1, y1 = int(math.floor(b.maxx / cs)), int(math.floor(b.maxy / cs))
-        cells = (x1 - x0 + 1) * (y1 - y0 + 1)
-
-        out: set = set(self._large)
-        if cells > len(self._boxes):
-            # Percorrer a grade sairia mais caro que olhar cada entidade. So
-            # entao vale varrer tudo -- o limite fixo que havia aqui antes fazia
-            # uma consulta grande devolver o desenho inteiro, e com o zoom bem
-            # aberto o raio de captura do snap chega a centenas de metros.
-            out = set(self._boxes)
-        else:
-            get = self._cells.get
-            for x in range(x0, x1 + 1):
-                for y in range(y0, y1 + 1):
-                    hit = get((x, y))
-                    if hit:
-                        out |= hit
+        out: set = set()
+        for level, rows in self._rows.items():
+            cs = self._cell_size(level)
+            x0, y0 = int(math.floor(b.minx / cs)), int(math.floor(b.miny / cs))
+            x1, y1 = int(math.floor(b.maxx / cs)), int(math.floor(b.maxy / cs))
+            ys = self._sorted_rows(level, rows)
+            ya = bisect.bisect_left(ys, y0)
+            yb = bisect.bisect_right(ys, y1)
+            for y in ys[ya:yb]:
+                row = rows[y]
+                xs = self._sorted_x(level, y, row)
+                xa = bisect.bisect_left(xs, x0)
+                xb = bisect.bisect_right(xs, x1)
+                for x in xs[xa:xb]:
+                    out.update(row[x])
         boxes = self._boxes
-        return {k for k in out if boxes[k].intersects(b)}
+        return {key for key in out if boxes[key].intersects(b)}
 
     def query_point(self, p: Vec2, radius: float) -> set:
         return self.query(BBox(p.x - radius, p.y - radius, p.x + radius, p.y + radius))

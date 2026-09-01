@@ -37,7 +37,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QTransform
 
 from ..core.dimensions import DIMENSION_TYPES
-from ..core.entities import POINT_LIKE, entity_point_lists, insert_has_text
+from ..core.entities import POINT_LIKE, _proxy_points, entity_point_lists, insert_has_text
 from ..core.geometry import decimate
 from .styles import aci_to_qcolor
 
@@ -62,9 +62,11 @@ MAX_HATCH_LINES = 5_000  # linhas de padrao por hachura
 HATCH_PATTERN_MIN_PX = 64.0
 HATCH_SOLID_ALPHA = 90  # opacidade da mancha que substitui o padrao
 BLOCK_DETAIL_MIN_PX = 20.0
+MAX_PROXY_DETAIL_BYTES = 30_000
 # Simplificar uma polilinha curta nunca tira vertice -- um retangulo de lote tem
 # cinco e todos sao cantos. So vale a pena onde ha vertices para descartar.
 DECIMATE_MIN_VERTS = 8
+MAX_PATH_VERTS = 8_192  # drawPath individual precisa caber em um frame
 # Conferir o relogio a cada entidade custaria mais que processar uma; a cada 512
 # o desvio do orcamento fica bem abaixo de um milissegundo.
 _CHUNK = 512
@@ -136,26 +138,88 @@ class _Cell:
     permite fatiar a regeneracao sem travar a interface.
     """
 
-    __slots__ = ("strokes", "fills", "verts", "pending")
+    __slots__ = ("strokes", "fills", "_stroke_sizes", "_fill_sizes", "verts", "pending")
 
     def __init__(self, pending: list[int] | None = None):
-        self.strokes: dict[tuple, QPainterPath] = {}
-        self.fills: dict[tuple, QPainterPath] = {}
+        self.strokes: dict[tuple, list[QPainterPath]] = {}
+        self.fills: dict[tuple, list[QPainterPath]] = {}
+        self._stroke_sizes: dict[tuple, list[int]] = {}
+        self._fill_sizes: dict[tuple, list[int]] = {}
         self.verts = 0
         self.pending: list[int] = pending or []
 
-    def stroke(self, key) -> QPainterPath:
-        path = self.strokes.get(key)
-        if path is None:
-            path = self.strokes[key] = QPainterPath()
-        return path
+    @staticmethod
+    def _take(groups, sizes, key, vertices: int, fill: bool) -> QPainterPath:
+        paths = groups.setdefault(key, [])
+        counts = sizes.setdefault(key, [])
+        if not paths or (counts[-1] and counts[-1] + vertices > MAX_PATH_VERTS):
+            path = QPainterPath()
+            if fill:
+                path.setFillRule(Qt.OddEvenFill)
+            paths.append(path)
+            counts.append(0)
+        counts[-1] += vertices
+        return paths[-1]
 
-    def fill(self, key) -> QPainterPath:
-        path = self.fills.get(key)
-        if path is None:
-            path = self.fills[key] = QPainterPath()
-            path.setFillRule(Qt.OddEvenFill)
-        return path
+    def stroke(self, key, vertices: int = 0) -> QPainterPath:
+        return self._take(self.strokes, self._stroke_sizes, key, vertices, False)
+
+    def fill(self, key, vertices: int = 0) -> QPainterPath:
+        return self._take(self.fills, self._fill_sizes, key, vertices, True)
+
+
+class _CellPass:
+    """Constroi e desenha um tile em paths pequenos, respeitando o prazo."""
+
+    __slots__ = ("display", "vp", "level", "key", "visible", "dark", "paths", "at")
+
+    def __init__(self, display, vp, level, key, visible, dark):
+        self.display = display
+        self.vp = vp
+        self.level = level
+        self.key = key
+        self.visible = visible
+        self.dark = dark
+        self.paths = None
+        self.at = 0
+
+    def __call__(self, painter, deadline) -> bool:
+        cell = self.display._cell(self.level, self.key, deadline)
+        if cell.pending:
+            return False
+        if self.paths is None:
+            paths = []
+            for key, chunks in cell.fills.items():
+                if self.visible[key[0]]:
+                    paths.extend((True, key, path) for path in chunks)
+            for key, chunks in cell.strokes.items():
+                if self.visible[key[0]]:
+                    paths.extend((False, key, path) for path in chunks)
+            self.paths = paths
+        if deadline is not None and time.perf_counter() >= deadline:
+            return False
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setWorldTransform(self.display._transform(self.vp), True)
+        try:
+            while self.at < len(self.paths):
+                fill, key, path = self.paths[self.at]
+                if fill:
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(self.display._qcolor(key, self.dark)))
+                else:
+                    painter.setBrush(Qt.NoBrush)
+                    pen = QPen(self.display._qcolor(key, self.dark), STROKE_WIDTH)
+                    pen.setCosmetic(True)
+                    painter.setPen(pen)
+                painter.drawPath(path)
+                self.at += 1
+                if deadline is not None and time.perf_counter() >= deadline:
+                    break
+        finally:
+            painter.restore()
+        return self.at >= len(self.paths)
 
 
 class DisplayList:
@@ -526,9 +590,7 @@ class DisplayList:
             # enquanto os tiles ainda estao sendo montados.
             steps.append(_InkPass(self, vp, ink, dark, dpr))
         for key in self._cell_keys(vp, vectors, level):
-            steps.append(
-                lambda p, d, k=key: self._draw_cell_step(p, vp, level, k, visible, dark, d)
-            )
+            steps.append(_CellPass(self, vp, level, key, visible, dark))
         entities = [self._ents[i] for i in markers.tolist() if self._ents[i] is not None]
         return steps, entities
 
@@ -660,19 +722,21 @@ class DisplayList:
             # camada justamente para que apagar uma camada seja pular um grupo,
             # e nao reconstruir o cache.
             painter.setPen(Qt.NoPen)
-            for k, path in cell.fills.items():
+            for k, chunks in cell.fills.items():
                 if not visible[k[0]]:
                     continue
                 painter.setBrush(QBrush(self._qcolor(k, dark)))
-                painter.drawPath(path)
+                for path in chunks:
+                    painter.drawPath(path)
             painter.setBrush(Qt.NoBrush)
-            for k, path in cell.strokes.items():
+            for k, chunks in cell.strokes.items():
                 if not visible[k[0]]:
                     continue
                 pen = QPen(self._qcolor(k, dark), STROKE_WIDTH)
                 pen.setCosmetic(True)  # espessura em pixels, nao em metros
                 painter.setPen(pen)
-                painter.drawPath(path)
+                for path in chunks:
+                    painter.drawPath(path)
         finally:
             painter.restore()
         return True
@@ -801,11 +865,10 @@ class DisplayList:
                     float(sizes[i]) / upw,
                 )
                 self._verts += cell.verts - before
-            # A granularidade tem de acompanhar a entidade mais cara, nao a
-            # media: uma polilinha de 8 mil vertices com bulge leva 19 ms
-            # sozinha, e conferir o relogio a cada oito entidades custa menos de
-            # um microssegundo.
-            if deadline is not None and done % 8 == 0 and time.perf_counter() >= deadline:
+            # Entidades topograficas variam de dois a dezenas de milhares de
+            # vertices. Conferir depois de cada uma impede que sete entidades
+            # adicionais entrem numa fatia cujo prazo ja terminou.
+            if deadline is not None and time.perf_counter() >= deadline:
                 break
         del pending[:done]
 
@@ -817,24 +880,44 @@ class DisplayList:
             self._bake_hatch(cell, entity, sagitta, ox, oy, layer, aci, size_px)
             return
         key = (layer, aci, 255)
+        if t == "ACAD_PROXY_ENTITY" and len(entity.proxy_graphic or b"") > MAX_PROXY_DETAIL_BYTES:
+            # Proxies gigantes de Civil 3D podem conter malhas que o leitor
+            # rapido nao reconhece. Decompo-las pelo ezdxf bloqueia o event loop
+            # por 50-200 ms por entidade. Se houver polilinhas suportadas elas
+            # seguem pelo caminho normal; caso contrario usamos a marca de bbox.
+            if _proxy_points(entity) is None:
+                self._bake_mark(cell.stroke(key, 4), entity, ox, oy)
+                cell.verts += 4
+                return
         if t == "INSERT" and size_px < BLOCK_DETAIL_MIN_PX:
             # O simbolo do bloco nao se le neste tamanho: uma cruz do tamanho
             # dele diz a mesma coisa por dois segmentos em vez de dezenas.
-            self._bake_mark(cell.stroke(key), entity, ox, oy)
+            self._bake_mark(cell.stroke(key, 4), entity, ox, oy)
             cell.verts += 4
             return
-        path = None
         for poly in entity_point_lists(entity, sagitta, expand_blocks=True):
             if len(poly) < 2:
                 continue
             if len(poly) > DECIMATE_MIN_VERTS:
                 poly = decimate(poly, sagitta)
-            if path is None:
-                path = cell.stroke(key)
-            path.moveTo(poly[0][0] - ox, poly[0][1] - oy)
-            for x, y in poly[1:]:
-                path.lineTo(x - ox, y - oy)
+            self._stroke_poly(cell, key, poly, ox, oy)
             cell.verts += len(poly)
+
+    @staticmethod
+    def _stroke_poly(cell: _Cell, key, poly, ox: float, oy: float) -> None:
+        """Acrescenta uma polilinha em chunks com continuidade entre eles."""
+        at = 0
+        size = len(poly)
+        while at < size - 1:
+            stop = min(size, at + MAX_PATH_VERTS)
+            chunk = poly[at:stop]
+            path = cell.stroke(key, len(chunk))
+            path.moveTo(chunk[0][0] - ox, chunk[0][1] - oy)
+            for x, y in chunk[1:]:
+                path.lineTo(x - ox, y - oy)
+            if stop >= size:
+                break
+            at = stop - 1
 
     def _bake_mark(self, path: QPainterPath, entity, ox: float, oy: float) -> None:
         """Cruz do tamanho da entidade, no lugar do desenho dela."""
@@ -867,12 +950,14 @@ class DisplayList:
 
         key = (layer, aci, alpha)
         if solid:
-            path = cell.fill(key)
             for poly in entity_point_lists(hatch, sagitta):
                 if len(poly) < 3:
                     continue
                 if len(poly) > DECIMATE_MIN_VERTS:
                     poly = decimate(poly, sagitta)
+                # Todos os aneis da hachura ficam no mesmo path OddEven: separar
+                # uma ilha em outro chunk a transformaria em preenchimento.
+                path = cell.fill(key)
                 path.moveTo(poly[0][0] - ox, poly[0][1] - oy)
                 for x, y in poly[1:]:
                     path.lineTo(x - ox, y - oy)
@@ -880,12 +965,12 @@ class DisplayList:
                 cell.verts += len(poly)
             return
 
-        path = cell.stroke(key)
         try:
             for n, line in enumerate(hatch.render_pattern_lines()):
                 if n >= MAX_HATCH_LINES:  # protege contra escala acidentalmente minuscula
                     break
                 start, end = line
+                path = cell.stroke(key, 2)
                 path.moveTo(start.x - ox, start.y - oy)
                 path.lineTo(end.x - ox, end.y - oy)
                 cell.verts += 2

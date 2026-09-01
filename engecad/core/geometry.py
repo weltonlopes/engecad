@@ -101,6 +101,53 @@ def decimate(points, tolerance: float):
     n = len(points)
     if n < 3 or tolerance <= 0:
         return points
+    if n >= 2048:
+        # O Douglas-Peucker Python abaixo tem pior caso quadratico. Uma unica
+        # polilinha topografica com dezenas de milhares de vertices furava em
+        # mais de um segundo o orcamento do frame. GEOS executa o mesmo
+        # algoritmo em codigo nativo; Shapely ja e dependencia do projeto.
+        try:
+            from shapely.geometry import LineString
+
+            # Primeiro descarte radial, O(n): todo ponto removido fica a menos
+            # da tolerancia de um vertice preservado e, portanto, tambem do
+            # segmento simplificado. Em levantamentos densos isso reduz 15 mil
+            # vertices a poucas centenas antes de chamar o Douglas-Peucker.
+            t2 = tolerance * tolerance
+            reduced = [points[0]]
+            ax, ay = points[0]
+            for point in points[1:-1]:
+                dx, dy = point[0] - ax, point[1] - ay
+                if dx * dx + dy * dy > t2:
+                    reduced.append(point)
+                    ax, ay = point[0], point[1]
+            reduced.append(points[-1])
+            points = reduced
+            n = len(points)
+            if n < 3:
+                return points
+
+            # GEOS tambem usa uma pilha recursiva: um zigue-zague adversarial de
+            # 25 mil pontos estoura a stack do Windows. Blocos sobrepostos
+            # preservam os extremos e mantem a mesma garantia de tolerancia.
+            out = []
+            chunk = 1024
+            at = 0
+            while at < n - 1:
+                stop = min(n, at + chunk)
+                simplified = LineString(points[at:stop]).simplify(
+                    tolerance, preserve_topology=False
+                )
+                coords = [(float(x), float(y)) for x, y, *_ in simplified.coords]
+                if len(coords) >= 2:
+                    out.extend(coords if not out else coords[1:])
+                if stop >= n:
+                    break
+                at = stop - 1
+            if len(out) >= 2:
+                return out
+        except (TypeError, ValueError):
+            pass
     t2 = tolerance * tolerance
     keep = bytearray(n)
     keep[0] = keep[n - 1] = 1
