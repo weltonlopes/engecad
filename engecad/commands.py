@@ -7,6 +7,17 @@ acionadores: linha de comando, console Python (api.command) e AutoLISP (v0.4).
 from __future__ import annotations
 
 from .core.coordinput import parse_coordinate
+from .tools.blocks import (
+    run_annotation_scale,
+    run_attribute_edit,
+    run_dynamic_edit,
+    run_explode,
+    run_project_attributes,
+    run_wblock,
+    start_block,
+    start_insert,
+    start_symbol,
+)
 from .tools.dimension import (
     AlignedDimensionTool,
     AngularDimensionTool,
@@ -80,6 +91,44 @@ def register_builtin_commands(reg) -> None:
     reg.register(
         "CARIMBOEDIT", edit_title_block, ("TITLEBLOCKEDIT",),
         "Edita os atributos do carimbo selecionado", "desenho", False,
+    )
+
+    # ---- blocos e simbolos ----
+    reg.register(
+        "BLOCK", start_block, ("B", "BLOCO"),
+        "Cria um bloco com os objetos selecionados", "blocos",
+    )
+    reg.register(
+        "INSERT", start_insert, ("I", "INSERIRBLOCO"),
+        "Insere uma definicao de bloco", "blocos",
+    )
+    reg.register(
+        "WBLOCK", run_wblock, ("W",),
+        "Grava bloco ou selecao em um DXF externo", "blocos",
+    )
+    reg.register(
+        "EXPLODE", run_explode, ("X", "EXPLODIR"),
+        "Explode referencias de bloco recursivamente", "blocos", False,
+    )
+    reg.register(
+        "ATTEDIT", run_attribute_edit, ("EATTEDIT", "ATRIBEDIT"),
+        "Edita os atributos do bloco selecionado", "blocos", False,
+    )
+    reg.register(
+        "DYNEDIT", run_dynamic_edit, ("BEDIT", "DINAMICO"),
+        "Edita largura, altura, rotacao, espelho e visibilidade", "blocos", False,
+    )
+    reg.register(
+        "SIMBOLO", start_symbol, ("SYMBOL",),
+        "Abre a biblioteca de simbolos topograficos e cadastrais", "blocos",
+    )
+    reg.register(
+        "ESCALAANOTATIVA", run_annotation_scale, ("CANNOSCALE",),
+        "Define a escala dos simbolos anotativos", "blocos", False,
+    )
+    reg.register(
+        "DADOSPROJETO", run_project_attributes, ("PROJECTDATA",),
+        "Edita os dados que alimentam os carimbos", "projeto", False,
     )
 
     # ---- cotas DXF nativas ----
@@ -250,6 +299,7 @@ def _set_scale(ctx, *args):
         ctx.message(f"Escala invalida: {args[0]}")
         return
     ctx.viewport.set_scale_denominator(denom)
+    ctx.doc.set_annotation_scale(denom)
     ctx.view_changed()
     ctx.message(f"Escala 1:{denom:.0f}")
 

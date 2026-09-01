@@ -185,6 +185,23 @@ class MainWindow(QMainWindow):
         m_draw.addAction(self._act("&Carimbo configuravel...", lambda: self.run("CARIMBO")))
         m_draw.addAction(self._act("Editar car&imbo...", lambda: self.run("CARIMBOEDIT")))
 
+        m_blocks = self.menuBar().addMenu("&Blocos")
+        m_blocks.addAction(self._act("&Criar bloco...", lambda: self.run("BLOCK"), tip="alias: B"))
+        m_blocks.addAction(
+            self._act("&Inserir bloco...", lambda: self.run("INSERT"), tip="alias: I")
+        )
+        m_blocks.addAction(
+            self._act("Gravar &WBLOCK...", lambda: self.run("WBLOCK"), tip="alias: W")
+        )
+        m_blocks.addAction(self._act("E&xplodir", lambda: self.run("EXPLODE"), tip="alias: X"))
+        m_blocks.addSeparator()
+        m_blocks.addAction(self._act("Biblioteca de &simbolos...", lambda: self.run("SIMBOLO")))
+        m_blocks.addAction(self._act("Editar &atributos...", lambda: self.run("ATTEDIT")))
+        m_blocks.addAction(self._act("Parametros &dinamicos...", lambda: self.run("DYNEDIT")))
+        m_blocks.addAction(
+            self._act("Escala a&notativa...", lambda: self.run("ESCALAANOTATIVA"))
+        )
+
         m_dim = self.menuBar().addMenu("&Cotas")
         m_dim.addAction(self._act("&Linear", lambda: self.run("DIMLINEAR"), tip="alias: DLI"))
         m_dim.addAction(self._act("&Alinhada", lambda: self.run("DIMALIGNED"), tip="alias: DAL"))
@@ -236,6 +253,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(self._act("Alternar &snap", lambda: self.run("OSNAP"), "F3"))
 
         m_proj = self.menuBar().addMenu("&Projeto")
+        m_proj.addAction(self._act("&Dados do projeto...", lambda: self.run("DADOSPROJETO")))
         m_proj.addAction(self._act("&Sistema de coordenadas...", self.on_change_crs))
         m_proj.addAction(self._act("&Imagens carregadas...", self.on_raster_info))
 
@@ -497,10 +515,14 @@ class MainWindow(QMainWindow):
     # ---------------- projeto ----------------
 
     def on_change_crs(self) -> None:
+        from ..core.titleblocks import update_title_blocks_from_project
+
         crs = CrsDialog.ask(self, self.ctx.doc.crs)
         if crs is None:
             return
         self.ctx.doc.crs = crs
+        self.ctx.doc.project_attributes["CRS"] = crs.display
+        update_title_blocks_from_project(self.ctx.doc)
         for layer in self.ctx.rasters:
             layer.set_project_crs(crs)
         self._update_title()

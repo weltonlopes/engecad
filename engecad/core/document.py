@@ -192,6 +192,20 @@ class Document:
         self._layer_cache: dict[str, tuple[bool, bool, int]] = {}
         self._modified = False
         self._current_layer = "0"
+        self.annotation_scale = 1000.0
+        self.project_attributes: dict[str, str] = {
+            "TITULO": "",
+            "PROJETO": "",
+            "CLIENTE": "",
+            "RESPONSAVEL": "",
+            "CREA_CAU": "",
+            "MUNICIPIO": "",
+            "IMOVEL": "",
+            "MATRICULA": "",
+            "FOLHA": "01/01",
+            "REVISAO": "00",
+            "CRS": self.crs.display,
+        }
         self.changed: list[Callable[[], None]] = []
         self.rebuild_index()
 
@@ -675,6 +689,25 @@ class Document:
         from .titleblocks import add_title_block
 
         return add_title_block(self, insert, config)
+
+    def insert_block(self, name, point, options=None):
+        from .blocks import insert_block
+
+        return insert_block(self, name, point, options)
+
+    def insert_symbol(self, key, point, **kwargs):
+        from .symbols import insert_symbol
+
+        return insert_symbol(self, key, point, **kwargs)
+
+    def set_annotation_scale(self, denominator: float) -> list:
+        from .blocks import update_annotative_symbols
+
+        self.annotation_scale = max(float(denominator), 1.0)
+        changed = update_annotative_symbols(self, self.annotation_scale)
+        if not changed:
+            self._touch()
+        return changed
 
     # ---------------- edicao ----------------
 

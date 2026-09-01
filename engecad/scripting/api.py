@@ -74,6 +74,55 @@ class ScriptAPI:
     def add_arc_length_dimension(self, center, p1, p2, base, layer=None, text="<>"):
         return self.doc.add_arc_length_dimension(center, p1, p2, base, layer=layer, text=text)
 
+    def create_block(self, name, entities, base=(0, 0), description=""):
+        from ..core.blocks import create_block_definition
+
+        return create_block_definition(
+            self.doc, name, self._as_list(entities), base, description=description
+        )
+
+    def insert_block(
+        self, name, point, scale=1.0, rotation=0.0, attributes=None, annotative=False
+    ):
+        from ..core.blocks import InsertOptions
+
+        return self.doc.insert_block(
+            name,
+            point,
+            InsertOptions(
+                scale_x=scale,
+                scale_y=scale,
+                rotation=rotation,
+                attributes=attributes or {},
+                annotative=annotative,
+                annotation_scale=self.doc.annotation_scale,
+            ),
+        )
+
+    def insert_symbol(self, key, point, attributes=None, state=""):
+        return self.doc.insert_symbol(key, point, attributes=attributes, state=state)
+
+    def explode(self, insert):
+        from ..core.blocks import explode_insert
+
+        return explode_insert(self.doc, insert)
+
+    def set_attributes(self, insert, **values):
+        from ..core.blocks import set_block_attributes
+
+        set_block_attributes(self.doc, insert, values)
+
+    def wblock(self, path, entities=None, block_name=None, base=(0, 0)):
+        from ..core.blocks import write_block_file
+
+        return write_block_file(
+            self.doc,
+            path,
+            entities=self._as_list(entities) if entities is not None else None,
+            block_name=block_name,
+            base=base,
+        )
+
     def erase(self, entities):
         if not isinstance(entities, (list, tuple, set)):
             entities = [entities]

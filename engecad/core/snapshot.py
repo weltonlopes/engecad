@@ -108,12 +108,14 @@ def snapshot(entity) -> dict | None:
     if t == "INSERT":
         return {
             "_t": t,
+            "name": str(dxf.name),
             "insert": _xy(dxf.insert),
             "rotation": float(dxf.get("rotation", 0.0)),
             "xscale": float(dxf.get("xscale", 1.0)),
             "yscale": float(dxf.get("yscale", 1.0)),
             "zscale": float(dxf.get("zscale", 1.0)),
             "attribs": [(str(a.dxf.tag), str(a.dxf.text)) for a in entity.attribs],
+            "xdata": copy.deepcopy(entity.xdata),
         }
 
     if t == "HATCH":
@@ -213,15 +215,27 @@ def restore(entity, snap: dict | None) -> bool:
         return True
 
     if t == "INSERT":
+        current_matrix = entity.matrix44()
+        dxf.name = snap["name"]
         dxf.insert = snap["insert"]
         dxf.rotation = snap["rotation"]
         dxf.xscale = snap["xscale"]
         dxf.yscale = snap["yscale"]
         dxf.zscale = snap["zscale"]
+        target_matrix = entity.matrix44()
+        try:
+            inverse = current_matrix.copy()
+            inverse.inverse()
+            for attrib in entity.attribs:
+                attrib.transform(inverse)
+                attrib.transform(target_matrix)
+        except (ZeroDivisionError, NotImplementedError):
+            pass
         values = dict(snap.get("attribs", ()))
         for attrib in entity.attribs:
             if attrib.dxf.tag in values:
                 attrib.dxf.text = values[attrib.dxf.tag]
+        entity.xdata = copy.deepcopy(snap.get("xdata"))
         return True
 
     if t == "HATCH":

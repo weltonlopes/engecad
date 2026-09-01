@@ -19,6 +19,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.associative import association_status
+from ..core.blocks import (
+    annotative_metadata,
+    block_attribute_values,
+    dynamic_parameters,
+)
 from ..core.dimensions import DIMENSION_TYPES, dimension_kind, dimension_measurement
 from ..core.entities import entity_insert_point, entity_polylines
 from ..core.geometry import Vec2, azimuth, format_dms, polygon_area, polyline_length
@@ -102,6 +107,13 @@ class PropertiesPanel(QWidget):
         self.lbl_measures.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(self.lbl_measures)
 
+        self.btn_attributes = QPushButton("Editar atributos...", self)
+        self.btn_attributes.clicked.connect(lambda: self.ctx.run_command("ATTEDIT"))
+        lay.addWidget(self.btn_attributes)
+        self.btn_dynamic = QPushButton("Parametros dinamicos...", self)
+        self.btn_dynamic.clicked.connect(lambda: self.ctx.run_command("DYNEDIT"))
+        lay.addWidget(self.btn_dynamic)
+
         self.sep_vertex = _hline(self)
         lay.addWidget(self.sep_vertex)
 
@@ -184,6 +196,7 @@ class PropertiesPanel(QWidget):
         self.btn_bylayer.setEnabled(False)
         self.lbl_measures.setText("")
         self._set_vertex_ui_visible(False)
+        self._set_block_ui_visible(False)
 
     def _show_multi(self, items: list) -> None:
         self._entity = None
@@ -210,6 +223,7 @@ class PropertiesPanel(QWidget):
 
         self.lbl_measures.setText(f"Comprimento total: {total:.3f} m")
         self._set_vertex_ui_visible(False)
+        self._set_block_ui_visible(False)
 
     def _show_single(self, entity) -> None:
         self._entity = entity
@@ -232,6 +246,7 @@ class PropertiesPanel(QWidget):
         self.btn_color.setStyleSheet(f"background-color: {aci_to_qcolor(abs(aci)).name()};")
 
         self.lbl_measures.setText(_entity_measures(entity, doc))
+        self._set_block_ui_visible(t == "INSERT", bool(getattr(entity, "attribs", ())))
 
         self._vertices = [g for g in entity_grips(entity) if g.kind == VERTEX]
         if self._vertices:
@@ -247,6 +262,10 @@ class PropertiesPanel(QWidget):
             w.setVisible(visible)
         if not visible:
             self.lbl_vertex_pos.setText("-/-")
+
+    def _set_block_ui_visible(self, visible: bool, has_attributes: bool = False) -> None:
+        self.btn_attributes.setVisible(visible and has_attributes)
+        self.btn_dynamic.setVisible(visible)
 
     def _refresh_vertex_fields(self) -> None:
         if not self._vertices:
@@ -417,6 +436,30 @@ def _entity_measures(entity, doc=None) -> str:
             lines.append(f"Escala: 1:{float(metadata.get('scale_denominator', 1)):g}")
             if values.get("TITULO"):
                 lines.append(f"Titulo: {values['TITULO']}")
+        elif t == "INSERT":
+            lines.append(f"Bloco: {dxf.get('name', '')}")
+            lines.append(
+                f"Escalas: X={float(dxf.get('xscale', 1) or 1):g}  "
+                f"Y={float(dxf.get('yscale', 1) or 1):g}"
+            )
+            lines.append(f"Rotacao: {float(dxf.get('rotation', 0) or 0):g} graus")
+            annotation = annotative_metadata(entity)
+            if annotation:
+                lines.append(
+                    f"Anotativo: {float(annotation['paper_size_mm']):g} mm "
+                    f"em 1:{float(annotation['scale_denominator']):g}"
+                )
+            dynamic = dynamic_parameters(entity)
+            if dynamic:
+                state = f", estado={dynamic.visibility}" if dynamic.visibility else ""
+                lines.append(
+                    f"Dinamico: largura={dynamic.stretch_x:g}, "
+                    f"altura={dynamic.stretch_y:g}{state}"
+                )
+            attributes = block_attribute_values(entity)
+            if attributes:
+                lines.append("Atributos:")
+                lines.extend(f"  {tag} = {value}" for tag, value in attributes.items())
 
     elif t == "HATCH":
         lines.append(f"Padrao: {dxf.get('pattern_name', 'SOLID')}")
