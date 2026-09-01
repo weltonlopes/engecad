@@ -32,7 +32,7 @@ from .dimensions import (
     read_dimension_style,
     rerender_dimension,
 )
-from .entities import entity_bbox
+from .entities import entity_bbox, invalidate_primitives
 from .geometry import BBox, Vec2
 from .hatches import (
     HatchSettings,
@@ -185,6 +185,10 @@ class Document:
         self.undo = UndoStack()
         self.index = GridIndex()
         self._by_handle: dict[str, object] = {}
+        #: Contador de mudancas de geometria, consumido pelos caches de desenho.
+        self.geometry_revision = 0
+        self._dirty_handles: set[str] = set()
+        self._dirty_all = True
         self._modified = False
         self._current_layer = "0"
         self.changed: list[Callable[[], None]] = []
@@ -302,6 +306,9 @@ class Document:
 
     def set_layer_color(self, name: str, aci: int) -> None:
         self.drawing.layers.get(name).dxf.color = int(aci)
+        # A display list agrupa a geometria por cor ja resolvida: mudar a cor da
+        # camada obriga a reagrupar.
+        self.invalidate_all_geometry()
         self._touch()
 
     def layer_is_locked(self, name: str) -> bool:
@@ -322,6 +329,33 @@ class Document:
             self._by_handle[h] = e
             items.append((h, entity_bbox(e)))
         self.index.build(items)
+        invalidate_primitives()
+        self._dirty_all = True
+        self._dirty_handles.clear()
+        self.geometry_revision += 1
+
+    def _mark_dirty(self, handle: str) -> None:
+        """Sinaliza que a geometria da entidade mudou.
+
+        Quem consome e a display list do canvas, que assim reconstroi apenas os
+        tiles afetados em vez do desenho inteiro.
+        """
+        invalidate_primitives(handle)
+        self._dirty_handles.add(handle)
+        self.geometry_revision += 1
+
+    def invalidate_all_geometry(self) -> None:
+        """Forca a reconstrucao completa dos caches de desenho."""
+        invalidate_primitives()
+        self._dirty_all = True
+        self.geometry_revision += 1
+
+    def consume_geometry_changes(self) -> tuple[bool, set[str]]:
+        """(reconstruir tudo, handles sujos) desde a ultima chamada."""
+        out = (self._dirty_all, self._dirty_handles)
+        self._dirty_all = False
+        self._dirty_handles = set()
+        return out
 
     def _index_add(self, entity) -> None:
         h = entity.dxf.get("handle")
@@ -329,6 +363,7 @@ class Document:
             return
         self._by_handle[h] = entity
         self.index.insert(h, entity_bbox(entity))
+        self._mark_dirty(h)
 
     def _index_update(self, entity) -> None:
         """Reposiciona a entidade no indice apos a geometria mudar."""
@@ -338,6 +373,7 @@ class Document:
         self.index.remove(h)
         self.index.insert(h, entity_bbox(entity))
         self._by_handle[h] = entity
+        self._mark_dirty(h)
 
     def _index_remove(self, entity) -> None:
         h = entity.dxf.get("handle")
@@ -345,6 +381,7 @@ class Document:
             return
         self._by_handle.pop(h, None)
         self.index.remove(h)
+        self._mark_dirty(h)
 
     def _update_associative_dimensions(
         self, source_handles: set[str] | None = None, dimensions: Iterable = ()
