@@ -40,6 +40,8 @@ from .crs_dialog import CrsDialog
 from .dimension_style_dialog import DimensionStyleDialog
 from .layer_panel import LayerPanel
 from .properties_panel import PropertiesPanel
+from .ribbon import RibbonBar
+from .ribbon_icons import cad_icon
 
 RASTER_FILTER = (
     "Imagens georreferenciadas (*.ecw *.tif *.tiff *.jp2 *.img *.sid *.vrt *.png *.jpg);;"
@@ -90,6 +92,7 @@ class MainWindow(QMainWindow):
         self._build_docks()
         self._build_status_bar()
         self._build_actions()
+        self._build_ribbon()
         self._connect()
 
         self.ctx.zoom_extents()
@@ -136,8 +139,14 @@ class MainWindow(QMainWindow):
         self.lbl_sel = QLabel("", self)
         self.lbl_sel.setMinimumWidth(120)
         self.lbl_crs = QLabel("", self)
-        for w in (self.lbl_coord, self.lbl_snap, self.lbl_sel,
-                  self.lbl_scale, self.lbl_layer, self.lbl_crs):
+        for w in (
+            self.lbl_coord,
+            self.lbl_snap,
+            self.lbl_sel,
+            self.lbl_scale,
+            self.lbl_layer,
+            self.lbl_crs,
+        ):
             sb.addPermanentWidget(w)
 
     def _act(self, text, slot, shortcut=None, tip=""):
@@ -158,9 +167,7 @@ class MainWindow(QMainWindow):
         m_file.addAction(self._act("Salvar &como...", self.on_save_as, "Ctrl+Shift+S"))
         m_file.addAction(self._act("Exportar &DWG...", self.on_export_dwg))
         m_file.addSeparator()
-        m_file.addAction(
-            self._act("&Importar imagem de fundo...", self.on_import_raster, "Ctrl+I")
-        )
+        m_file.addAction(self._act("&Importar imagem de fundo...", self.on_import_raster, "Ctrl+I"))
         m_file.addAction(
             self._act("Importar &shapefile...", self.on_import_shapefile, "Ctrl+Shift+I")
         )
@@ -185,12 +192,25 @@ class MainWindow(QMainWindow):
         m_draw.addAction(self._act("&Hachura...", lambda: self.run("HATCH"), tip="alias: H"))
         m_draw.addAction(self._act("Editar hac&hura...", lambda: self.run("HATCHEDIT"), tip="HE"))
         m_draw.addAction(self._act("&Regenerar hachuras", lambda: self.run("HATCHREGEN")))
-        m_draw.addAction(
-            self._act("&Desassociar hachura", lambda: self.run("HATCHDISASSOCIATE"))
-        )
+        m_draw.addAction(self._act("&Desassociar hachura", lambda: self.run("HATCHDISASSOCIATE")))
         m_draw.addSeparator()
         m_draw.addAction(self._act("&Carimbo configuravel...", lambda: self.run("CARIMBO")))
         m_draw.addAction(self._act("Editar car&imbo...", lambda: self.run("CARIMBOEDIT")))
+
+        m_blocks = self.menuBar().addMenu("&Blocos")
+        m_blocks.addAction(self._act("&Criar bloco...", lambda: self.run("BLOCK"), tip="alias: B"))
+        m_blocks.addAction(
+            self._act("&Inserir bloco...", lambda: self.run("INSERT"), tip="alias: I")
+        )
+        m_blocks.addAction(
+            self._act("Gravar &WBLOCK...", lambda: self.run("WBLOCK"), tip="alias: W")
+        )
+        m_blocks.addAction(self._act("E&xplodir", lambda: self.run("EXPLODE"), tip="alias: X"))
+        m_blocks.addSeparator()
+        m_blocks.addAction(self._act("Biblioteca de &simbolos...", lambda: self.run("SIMBOLO")))
+        m_blocks.addAction(self._act("Editar &atributos...", lambda: self.run("ATTEDIT")))
+        m_blocks.addAction(self._act("Parametros &dinamicos...", lambda: self.run("DYNEDIT")))
+        m_blocks.addAction(self._act("Escala a&notativa...", lambda: self.run("ESCALAANOTATIVA")))
 
         m_dim = self.menuBar().addMenu("&Cotas")
         m_dim.addAction(self._act("&Linear", lambda: self.run("DIMLINEAR"), tip="alias: DLI"))
@@ -225,9 +245,7 @@ class MainWindow(QMainWindow):
         m_mod.addAction(self._act("E&stender", lambda: self.run("EXTEND"), tip="alias: EX"))
         m_mod.addAction(self._act("Apa&gar", lambda: self.run("ERASE"), "Del", "alias: E"))
         m_mod.addSeparator()
-        m_mod.addAction(
-            self._act("Selecionar &tudo", lambda: self.run("SELTUDO"), "Ctrl+A")
-        )
+        m_mod.addAction(self._act("Selecionar &tudo", lambda: self.run("SELTUDO"), "Ctrl+A"))
         m_mod.addAction(self._act("&Limpar selecao", lambda: self.run("SELNADA")))
 
         m_query = self.menuBar().addMenu("&Consultar")
@@ -243,6 +261,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(self._act("Alternar &snap", lambda: self.run("OSNAP"), "F3"))
 
         m_proj = self.menuBar().addMenu("&Projeto")
+        m_proj.addAction(self._act("&Dados do projeto...", lambda: self.run("DADOSPROJETO")))
         m_proj.addAction(self._act("&Sistema de coordenadas...", self.on_change_crs))
         m_proj.addAction(self._act("&Imagens carregadas...", self.on_raster_info))
 
@@ -264,6 +283,384 @@ class MainWindow(QMainWindow):
         m_help.addAction(self._act("Diagnostico de D&WG...", self.on_diagnose_dwg))
         m_help.addAction(self._act("&Sobre o EngeCAD", self.on_about))
 
+    def _build_ribbon(self) -> None:
+        """Monta a Ribbon a partir dos mesmos comandos usados pela linha de comando."""
+        # Ao substituir visualmente o menu, mantemos suas acoes registradas na
+        # janela para que atalhos como Ctrl+S, F3 e Del continuem globais.
+        menu_bar = self.menuBar()
+        for menu_action in menu_bar.actions():
+            menu = menu_action.menu()
+            if menu is None:
+                continue
+            for action in menu.actions():
+                if not action.isSeparator():
+                    self.addAction(action)
+
+        self.ribbon = RibbonBar(self)
+        # QMainWindow reserva esta faixa acima de docks e area central; desse
+        # modo a Ribbon ocupa a largura inteira, como em um CAD desktop.
+        self.setMenuWidget(self.ribbon)
+        self.ribbon_command_actions: dict[str, QAction] = {}
+
+        labels = {
+            "LINE": "Linha",
+            "PLINE": "Polilinha",
+            "RECT": "Retângulo",
+            "CIRCLE": "Círculo",
+            "ARC": "Arco",
+            "TEXT": "Texto",
+            "HATCH": "Hachura",
+            "HATCHEDIT": "Editar hachura",
+            "HATCHREGEN": "Regenerar",
+            "HATCHDISASSOCIATE": "Desassociar",
+            "CARIMBO": "Carimbo",
+            "CARIMBOEDIT": "Editar carimbo",
+            "BLOCK": "Criar bloco",
+            "INSERT": "Inserir bloco",
+            "WBLOCK": "Gravar WBLOCK",
+            "EXPLODE": "Explodir",
+            "ATTEDIT": "Atributos",
+            "DYNEDIT": "Parâmetros",
+            "SIMBOLO": "Símbolos",
+            "ESCALAANOTATIVA": "Escala anotativa",
+            "DADOSPROJETO": "Dados do projeto",
+            "DIMLINEAR": "Linear",
+            "DIMALIGNED": "Alinhada",
+            "DIMROTATED": "Rotacionada",
+            "DIMHORIZONTAL": "Horizontal",
+            "DIMVERTICAL": "Vertical",
+            "DIMANGULAR": "Angular",
+            "DIMRADIUS": "Raio",
+            "DIMDIAMETER": "Diâmetro",
+            "DIMARC": "Compr. de arco",
+            "DIMORDINATE": "Ordenada",
+            "DIMSTYLE": "Estilo de cotas",
+            "DIMREASSOCIATE": "Reassociar",
+            "DIMDISASSOCIATE": "Desassociar",
+            "DIMREGEN": "Regenerar cotas",
+            "MOVE": "Mover",
+            "COPY": "Copiar",
+            "ROTATE": "Girar",
+            "MIRROR": "Espelhar",
+            "SCALE": "Escalar",
+            "OFFSET": "Paralela",
+            "TRIM": "Aparar",
+            "EXTEND": "Estender",
+            "ERASE": "Apagar",
+            "SELTUDO": "Selecionar tudo",
+            "SELNADA": "Limpar seleção",
+            "DIST": "Distância",
+            "AREA": "Área",
+            "ZE": "Enquadrar tudo",
+            "ZOOM": "Zoom por fator",
+            "ESCALA": "Escala da vista",
+            "PAN": "Panorâmica",
+            "GRADE": "Grade",
+            "U": "Desfazer",
+            "REDO": "Refazer",
+            "CAMADA": "Camada corrente",
+            "OSNAP": "Snap ao objeto",
+            "AJUDA": "Comandos",
+        }
+
+        for definition in self.ctx.registry.definitions():
+            name = definition.name
+            action = QAction(cad_icon(name), labels.get(name, name.title()), self)
+            action.setProperty("command", name)
+            aliases = ", ".join(definition.aliases)
+            tip = f"{definition.description}\nComando: {name}"
+            if aliases:
+                tip += f"  •  Atalhos: {aliases}"
+            action.setToolTip(tip)
+            action.setStatusTip(definition.description)
+            if definition.interactive or name in {"GRADE", "OSNAP"}:
+                action.setCheckable(True)
+            if name == "GRADE":
+                action.setChecked(self.canvas.show_grid)
+            elif name == "OSNAP":
+                action.setChecked(self.ctx.snap.active)
+            if name == "DIMSTYLE":
+                action.triggered.connect(lambda _checked=False: self.on_dimension_style())
+            else:
+                action.triggered.connect(
+                    lambda _checked=False, command=name: self._run_ribbon_command(command)
+                )
+            self.ribbon_command_actions[name] = action
+
+        window_actions = self._ribbon_window_actions()
+        for key in ("NEW", "OPEN", "SAVE", "U", "REDO"):
+            action = window_actions.get(key) or self.ribbon_command_actions[key]
+            self.ribbon.add_quick_action(action)
+
+        layout = (
+            (
+                "Início",
+                (
+                    (
+                        "Arquivo",
+                        (("@NEW", True), ("@OPEN", False), ("@SAVE", False), ("@SAVE_AS", False)),
+                    ),
+                    (
+                        "Desenhar",
+                        (
+                            ("LINE", True),
+                            ("PLINE", False),
+                            ("RECT", False),
+                            ("CIRCLE", False),
+                            ("ARC", False),
+                            ("TEXT", False),
+                        ),
+                    ),
+                    (
+                        "Modificar",
+                        (
+                            ("MOVE", True),
+                            ("COPY", False),
+                            ("ROTATE", False),
+                            ("MIRROR", False),
+                            ("SCALE", False),
+                            ("OFFSET", False),
+                            ("TRIM", False),
+                            ("EXTEND", False),
+                            ("ERASE", False),
+                        ),
+                    ),
+                    ("Seleção", (("SELTUDO", True), ("SELNADA", False))),
+                    ("Organizar", (("CAMADA", True), ("U", False), ("REDO", False))),
+                ),
+            ),
+            (
+                "Inserir",
+                (
+                    (
+                        "Bloco",
+                        (
+                            ("BLOCK", True),
+                            ("INSERT", True),
+                            ("WBLOCK", False),
+                            ("EXPLODE", False),
+                            ("ATTEDIT", False),
+                            ("DYNEDIT", False),
+                        ),
+                    ),
+                    ("Biblioteca", (("SIMBOLO", True), ("ESCALAANOTATIVA", False))),
+                    (
+                        "Projeto",
+                        (("DADOSPROJETO", True), ("CARIMBO", False), ("CARIMBOEDIT", False)),
+                    ),
+                    (
+                        "Referência",
+                        (("@IMPORT_RASTER", True), ("@IMPORT_SHP", False), ("@RASTER_INFO", False)),
+                    ),
+                ),
+            ),
+            (
+                "Anotar",
+                (
+                    (
+                        "Cotas lineares",
+                        (
+                            ("DIMLINEAR", True),
+                            ("DIMALIGNED", True),
+                            ("DIMROTATED", False),
+                            ("DIMHORIZONTAL", False),
+                            ("DIMVERTICAL", False),
+                        ),
+                    ),
+                    (
+                        "Outras cotas",
+                        (
+                            ("DIMANGULAR", True),
+                            ("DIMRADIUS", False),
+                            ("DIMDIAMETER", False),
+                            ("DIMARC", False),
+                            ("DIMORDINATE", False),
+                        ),
+                    ),
+                    (
+                        "Gerenciar cotas",
+                        (
+                            ("DIMSTYLE", True),
+                            ("DIMREASSOCIATE", False),
+                            ("DIMDISASSOCIATE", False),
+                            ("DIMREGEN", False),
+                        ),
+                    ),
+                    (
+                        "Detalhamento",
+                        (
+                            ("HATCH", True),
+                            ("HATCHEDIT", False),
+                            ("HATCHREGEN", False),
+                            ("HATCHDISASSOCIATE", False),
+                        ),
+                    ),
+                ),
+            ),
+            (
+                "Vista",
+                (
+                    ("Navegar", (("ZE", True), ("ZOOM", False), ("PAN", False))),
+                    ("Escala e grade", (("ESCALA", True), ("GRADE", False), ("OSNAP", False))),
+                    ("Consultar", (("DIST", True), ("AREA", True))),
+                    ("Paletas", (("@PROPERTIES", True), ("@LAYERS", False), ("@CONSOLE", False))),
+                ),
+            ),
+            (
+                "Gerenciar",
+                (
+                    ("Automação", (("@SCRIPT", True), ("@CONSOLE", False))),
+                    (
+                        "Coordenadas",
+                        (("@CRS", True), ("@RASTER_INFO", False), ("@RASTER_DIAG", False)),
+                    ),
+                    ("Ajuda", (("AJUDA", True), ("@ABOUT", False))),
+                    ("Aplicativo", (("@EXIT", True),)),
+                ),
+            ),
+        )
+
+        for tab_title, panels in layout:
+            page = self.ribbon.add_tab(tab_title)
+            for panel_title, items in panels:
+                panel = self.ribbon.add_panel(page, panel_title)
+                for key, large in items:
+                    action = (
+                        window_actions[key[1:]]
+                        if key.startswith("@")
+                        else self.ribbon_command_actions[key]
+                    )
+                    self.ribbon.add_action(panel, action, large=large)
+
+        # Extensoes futuras do registro nunca ficam invisiveis: comandos que
+        # ainda nao tenham posicao explicita entram na ultima guia.
+        remaining = set(self.ribbon_command_actions) - self.ribbon.command_names
+        if remaining:
+            panel = self.ribbon.add_panel(page, "Outros comandos")
+            for name in sorted(remaining):
+                self.ribbon.add_action(panel, self.ribbon_command_actions[name])
+
+        toggle_ribbon = QAction("Minimizar/expandir Ribbon", self)
+        toggle_ribbon.setShortcut(QKeySequence("Ctrl+F1"))
+        toggle_ribbon.triggered.connect(self.ribbon.toggle_minimized)
+        self.addAction(toggle_ribbon)
+        self.action_toggle_ribbon = toggle_ribbon
+
+        # Os menus continuam construidos (e seus atalhos ativos), mas a Ribbon
+        # passa a ocupar a faixa de menu e evita uma segunda navegacao redundante.
+
+    def _ribbon_window_actions(self) -> dict[str, QAction]:
+        specs = {
+            "NEW": ("Novo", self.on_new, "Criar um novo desenho"),
+            "OPEN": ("Abrir", self.on_open, "Abrir desenho DXF"),
+            "SAVE": ("Salvar", self.on_save, "Salvar o desenho atual"),
+            "SAVE_AS": ("Salvar como", self.on_save_as, "Salvar em outro arquivo"),
+            "IMPORT_RASTER": ("Imagem", self.on_import_raster, "Importar imagem georreferenciada"),
+            "IMPORT_SHP": ("Shapefile", self.on_import_shapefile, "Importar arquivo shapefile"),
+            "RASTER_INFO": ("Imagens", self.on_raster_info, "Ver imagens carregadas"),
+            "PROPERTIES": (
+                "Propriedades",
+                self.dock_properties.toggleViewAction().trigger,
+                "Mostrar ou ocultar propriedades",
+            ),
+            "LAYERS": (
+                "Camadas",
+                self.dock_layers.toggleViewAction().trigger,
+                "Mostrar ou ocultar camadas",
+            ),
+            "CONSOLE": (
+                "Console Python",
+                self.dock_console.toggleViewAction().trigger,
+                "Mostrar ou ocultar o console Python",
+            ),
+            "SCRIPT": ("Executar script", self.on_run_script, "Executar arquivo Python"),
+            "CRS": ("Sistema de coordenadas", self.on_change_crs, "Alterar o CRS do projeto"),
+            "RASTER_DIAG": (
+                "Diagnóstico raster",
+                self.on_diagnose,
+                "Diagnosticar suporte a raster",
+            ),
+            "ABOUT": ("Sobre", self.on_about, "Sobre o EngeCAD"),
+            "EXIT": ("Sair", self.close, "Fechar o EngeCAD"),
+        }
+        icon_keys = {
+            "PROPERTIES": "ATTEDIT",
+            "LAYERS": "CAMADA",
+            "CONSOLE": "SCRIPT",
+            "SCRIPT": "SCRIPT",
+            "CRS": "GLOBE",
+            "RASTER_INFO": "IMPORT_RASTER",
+            "RASTER_DIAG": "DIAG",
+            "ABOUT": "AJUDA",
+            "EXIT": "EXIT",
+        }
+        actions = {}
+        for key, (label, slot, tip) in specs.items():
+            docks = {
+                "PROPERTIES": self.dock_properties,
+                "LAYERS": self.dock_layers,
+                "CONSOLE": self.dock_console,
+            }
+            if key in docks:
+                action = docks[key].toggleViewAction()
+                action.setText(label)
+                action.setIcon(cad_icon(icon_keys.get(key, key)))
+            else:
+                action = QAction(cad_icon(icon_keys.get(key, key)), label, self)
+                action.triggered.connect(slot)
+            action.setProperty("actionId", key)
+            action.setToolTip(tip)
+            action.setStatusTip(tip)
+            actions[key] = action
+        return actions
+
+    def _run_ribbon_command(self, name: str) -> None:
+        if name == "ZOOM":
+            factor, ok = QInputDialog.getDouble(
+                self, "Zoom", "Fator de aproximação:", 1.25, 0.01, 100.0, 2
+            )
+            if not ok:
+                return
+            self.run(name, str(factor))
+            return
+        if name == "ESCALA":
+            current = max(1, round(self.ctx.viewport.scale_denominator()))
+            denominator, ok = QInputDialog.getInt(
+                self, "Escala da vista", "Denominador (1:N):", current, 1, 100_000_000
+            )
+            if not ok:
+                return
+            self.run(name, str(denominator))
+            return
+        if name == "PAN":
+            center = self.ctx.viewport.center
+            coordinate, ok = QInputDialog.getText(
+                self,
+                "Centralizar vista",
+                "Coordenada E,N:",
+                text=f"{center.x:.3f},{center.y:.3f}",
+            )
+            if not ok or not coordinate.strip():
+                return
+            self.run(name, coordinate)
+            return
+        if name == "CAMADA":
+            self.dock_layers.show()
+            self.dock_layers.raise_()
+            self.ctx.message(f"Camada corrente: {self.ctx.doc.current_layer}")
+            return
+        self.run(name)
+        if name == "GRADE":
+            self.ribbon_command_actions[name].setChecked(self.canvas.show_grid)
+        elif name == "OSNAP":
+            self.ribbon_command_actions[name].setChecked(self.ctx.snap.active)
+
+    def _sync_ribbon_tool(self, tool) -> None:
+        active = "" if tool is None or tool.is_idle else getattr(tool, "name", "")
+        for name, action in self.ribbon_command_actions.items():
+            if action.isCheckable() and name not in {"GRADE", "OSNAP"}:
+                action.setChecked(name == active)
+
     def _connect(self) -> None:
         self.canvas.coordinateMoved.connect(self._on_coordinate)
         self.canvas.snapChanged.connect(self._on_snap)
@@ -272,9 +669,16 @@ class MainWindow(QMainWindow):
         self.ctx.documentChanged.connect(self._update_title)
         self.ctx.documentReplaced.connect(self._on_document_replaced)
         self.ctx.viewChanged.connect(self._on_view)
+        self.ctx.toolChanged.connect(self._sync_ribbon_tool)
+        self.ctx.layerManagerRequested.connect(self._show_layer_manager)
         self._on_view()
         self._on_document_replaced()
         self._on_selection()
+
+    def _show_layer_manager(self) -> None:
+        self.dock_layers.show()
+        self.dock_layers.raise_()
+        self.layer_panel.setFocus()
 
     # ---------------- atalho de comando ----------------
 
@@ -301,6 +705,9 @@ class MainWindow(QMainWindow):
         self.lbl_scale.setText(f"1:{vp.scale_denominator():,.0f}".replace(",", "."))
 
     def _on_message(self, text: str) -> None:
+        if hasattr(self, "ribbon_command_actions"):
+            self.ribbon_command_actions["GRADE"].setChecked(self.canvas.show_grid)
+            self.ribbon_command_actions["OSNAP"].setChecked(self.ctx.snap.active)
         first = text.splitlines()[0] if text else ""
         self.statusBar().showMessage(first, 8000)
         if "\n" in text:
@@ -535,10 +942,14 @@ class MainWindow(QMainWindow):
     # ---------------- projeto ----------------
 
     def on_change_crs(self) -> None:
+        from ..core.titleblocks import update_title_blocks_from_project
+
         crs = CrsDialog.ask(self, self.ctx.doc.crs)
         if crs is None:
             return
         self.ctx.doc.crs = crs
+        self.ctx.doc.project_attributes["CRS"] = crs.display
+        update_title_blocks_from_project(self.ctx.doc)
         for layer in self.ctx.rasters:
             layer.set_project_crs(crs)
         self._update_title()

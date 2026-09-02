@@ -89,7 +89,10 @@ def edit_hatch(ctx, *args):
 
 
 def start_title_block(ctx, *args):
-    config = TitleBlockConfig(scale_denominator=ctx.viewport.scale_denominator())
+    config = TitleBlockConfig(
+        scale_denominator=ctx.doc.annotation_scale,
+        values=dict(ctx.doc.project_attributes),
+    )
     config.values["CRS"] = ctx.doc.crs.display
     dialog = TitleBlockDialog(config, parent=ctx.canvas)
     if dialog.exec() != QDialog.Accepted:

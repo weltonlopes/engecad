@@ -7,6 +7,17 @@ acionadores: linha de comando, console Python (api.command) e AutoLISP (v0.4).
 from __future__ import annotations
 
 from .core.coordinput import parse_coordinate
+from .tools.blocks import (
+    run_annotation_scale,
+    run_attribute_edit,
+    run_dynamic_edit,
+    run_explode,
+    run_project_attributes,
+    run_wblock,
+    start_block,
+    start_insert,
+    start_symbol,
+)
 from .tools.dimension import (
     AlignedDimensionTool,
     AngularDimensionTool,
@@ -80,6 +91,44 @@ def register_builtin_commands(reg) -> None:
     reg.register(
         "CARIMBOEDIT", edit_title_block, ("TITLEBLOCKEDIT",),
         "Edita os atributos do carimbo selecionado", "desenho", False,
+    )
+
+    # ---- blocos e simbolos ----
+    reg.register(
+        "BLOCK", start_block, ("B", "BLOCO"),
+        "Cria um bloco com os objetos selecionados", "blocos",
+    )
+    reg.register(
+        "INSERT", start_insert, ("I", "INSERIRBLOCO"),
+        "Insere uma definicao de bloco", "blocos",
+    )
+    reg.register(
+        "WBLOCK", run_wblock, ("W",),
+        "Grava bloco ou selecao em um DXF externo", "blocos",
+    )
+    reg.register(
+        "EXPLODE", run_explode, ("X", "EXPLODIR"),
+        "Explode referencias de bloco recursivamente", "blocos", False,
+    )
+    reg.register(
+        "ATTEDIT", run_attribute_edit, ("EATTEDIT", "ATRIBEDIT"),
+        "Edita os atributos do bloco selecionado", "blocos", False,
+    )
+    reg.register(
+        "DYNEDIT", run_dynamic_edit, ("BEDIT", "DINAMICO"),
+        "Edita largura, altura, rotacao, espelho e visibilidade", "blocos", False,
+    )
+    reg.register(
+        "SIMBOLO", start_symbol, ("SYMBOL",),
+        "Abre a biblioteca de simbolos topograficos e cadastrais", "blocos",
+    )
+    reg.register(
+        "ESCALAANOTATIVA", run_annotation_scale, ("CANNOSCALE",),
+        "Define a escala dos simbolos anotativos", "blocos", False,
+    )
+    reg.register(
+        "DADOSPROJETO", run_project_attributes, ("PROJECTDATA",),
+        "Edita os dados que alimentam os carimbos", "projeto", False,
     )
 
     # ---- cotas DXF nativas ----
@@ -250,6 +299,7 @@ def _set_scale(ctx, *args):
         ctx.message(f"Escala invalida: {args[0]}")
         return
     ctx.viewport.set_scale_denominator(denom)
+    ctx.doc.set_annotation_scale(denom)
     ctx.view_changed()
     ctx.message(f"Escala 1:{denom:.0f}")
 
@@ -308,12 +358,52 @@ def _redo(ctx, *args):
 
 def _set_layer(ctx, *args):
     if not args:
+        ctx.layerManagerRequested.emit()
         ctx.message(f"Camada corrente: {ctx.doc.current_layer}")
         return
-    name = str(args[0]).strip()
-    ctx.doc.current_layer = name
+    manager = ctx.doc.layer_manager
+    tokens = [str(arg).strip() for arg in args if str(arg).strip()]
+    operation = tokens[0].upper()
+    try:
+        if operation in {"NEW", "NOVA", "NOVO"} and len(tokens) > 1:
+            manager.create(" ".join(tokens[1:]))
+            ctx.message(f"Camada criada: {' '.join(tokens[1:])}")
+        elif operation in {"DELETE", "EXCLUIR", "APAGAR"} and len(tokens) > 1:
+            manager.delete(" ".join(tokens[1:]))
+            ctx.message(f"Camada excluida: {' '.join(tokens[1:])}")
+        elif operation in {"RENAME", "RENOMEAR"} and len(tokens) > 2:
+            manager.rename(tokens[1], " ".join(tokens[2:]))
+            ctx.message(f"Camada renomeada: {tokens[1]} -> {' '.join(tokens[2:])}")
+        elif operation in {"ON", "LIGAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), on=True)
+        elif operation in {"OFF", "DESLIGAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), on=False)
+        elif operation in {"FREEZE", "CONGELAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), frozen=True)
+        elif operation in {"THAW", "DESCONGELAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), frozen=False)
+        elif operation in {"LOCK", "BLOQUEAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), locked=True)
+        elif operation in {"UNLOCK", "DESBLOQUEAR"} and len(tokens) > 1:
+            manager.update(" ".join(tokens[1:]), locked=False)
+        elif operation in {"STATE", "ESTADO"} and len(tokens) > 2:
+            action, state_name = tokens[1].upper(), " ".join(tokens[2:])
+            if action in {"SAVE", "SALVAR"}:
+                manager.save_state(state_name)
+                ctx.message(f"Estado salvo: {state_name}")
+            elif action in {"RESTORE", "RESTAURAR"}:
+                manager.restore_state(state_name)
+                ctx.message(f"Estado restaurado: {state_name}")
+            else:
+                raise ValueError("Use CAMADA ESTADO SALVAR|RESTAURAR <nome>")
+        else:
+            name = " ".join(tokens[1:] if operation in {"SET", "ATUAL"} else tokens)
+            manager.set_current(name)
+            ctx.message(f"Camada corrente: {name}")
+    except Exception as exc:
+        ctx.message(f"Camada: {exc}")
+        return
     ctx.documentChanged.emit()
-    ctx.message(f"Camada corrente: {name}")
 
 
 def _toggle_osnap(ctx, *args):

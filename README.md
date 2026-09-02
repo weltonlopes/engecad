@@ -36,6 +36,7 @@ python -m engecad planta.dxf     # abre um desenho direto
 
 | | |
 |---|---|
+| **Interface** | Ribbon escura em 5 guias, com todos os comandos, ícones vetoriais, acesso rápido e modo compacto (`Ctrl+F1`) |
 | **Vista** | pan (botão do meio), zoom ancorado no cursor, grade adaptativa, escala 1:N |
 | **Coordenadas** | CRS via PROJ/pyproj, SIRGAS 2000 / UTM pré-configurado, E/N ao vivo na barra de status |
 | **Imagem de fundo** | GeoTIFF/COG, JP2, ECW (ver abaixo), reprojeção on-the-fly, leitura decimada por overviews |
@@ -43,6 +44,8 @@ python -m engecad planta.dxf     # abre um desenho direto
 | **Cotas DXF** | linear, alinhada, rotacionada, angular, raio, diâmetro, arco e ordenada; associativas e com DIMSTYLE métrico |
 | **Hachuras DXF** | sólido, 172 padrões métricos/ANSI e `.PAT`; ilhas, escala, ângulo, cor, transparência, área e limites associativos |
 | **Carimbos** | blocos A0–A4 em paisagem/retrato, escala de plotagem e 13 campos editáveis persistidos como atributos DXF |
+| **Blocos** | `BLOCK`, `INSERT`, `WBLOCK`, explosão recursiva, atributos editáveis e parâmetros dinâmicos simplificados |
+| **Símbolos** | biblioteca topográfica/cadastral com 14 símbolos nativos e tamanho anotativo conforme a escala |
 | **Seleção** | clique, janela (→) e captura (←), Shift para somar/tirar, realce ao passar o cursor |
 | **Grips** | esticar vértice, mover entidade, mudar raio e ângulo — arrastando, sem comando |
 | **Edição** | mover, copiar, girar, espelhar, escalar, paralela, aparar, estender, apagar |
@@ -71,6 +74,10 @@ O `<<` para azimute é a forma direta de lançar um memorial descritivo.
 Digitar com o foco no desenho já cai na linha de comando — não precisa clicar lá
 embaixo antes de cada comando.
 
+A Ribbon organiza as ferramentas em **Início**, **Inserir**, **Anotar**, **Vista**
+e **Gerenciar**. Dê dois cliques numa guia ou use `Ctrl+F1` para recolhê-la e
+ganhar área de desenho; os atalhos e os comandos digitados continuam os mesmos.
+
 ### Comandos
 
 | Desenhar | Modificar | Vista / geral |
@@ -82,6 +89,8 @@ embaixo antes de cada comando.
 | `ARC` `A` | `SCALE` `SC` | `GRADE` `F7` |
 | `TEXT` `T` | `OFFSET` `O` | `OSNAP` `F3` |
 | `HATCH` `H` | `HATCHEDIT` `HE` | `CARIMBO` / `CARIMBOEDIT` |
+| `BLOCK` `B` | `EXPLODE` `X` | `INSERT` `I` · `WBLOCK` `W` |
+| `SIMBOLO` | `ATTEDIT` | `DYNEDIT` · `ESCALAANOTATIVA` |
 | `DIMLINEAR` `DLI` | | |
 | `DIMALIGNED` `DAL` | | |
 | `DIMANGULAR` `DAN` | | |
@@ -111,6 +120,18 @@ As hachuras acompanham MOVE, ROTATE, SCALE e edição por grips dos limites. O
 diálogo também carrega padrões AutoCAD `.PAT`. `CARIMBO` insere um bloco nativo
 na escala corrente da vista, com formato A0–A4, orientação, folha, revisão,
 responsável, CREA/CAU, imóvel, matrícula, CRS e demais campos editáveis.
+
+`BLOCK` transforma a seleção em uma definição DXF reutilizável; `INSERT` abre
+as definições e a biblioteca incorporada; `WBLOCK` grava uma definição ou
+seleção como DXF independente; `EXPLODE` decompõe inclusive blocos aninhados e
+converte atributos em textos. `ATTEDIT` edita os `ATTRIB`, e `DYNEDIT` oferece
+largura, altura, rotação, espelhamento e estados de visibilidade sem criar
+entidades proprietárias. Os símbolos são anotativos: o tamanho informado em
+milímetros de papel é recalculado por `ESCALAANOTATIVA` ou `ESCALA`.
+
+Em **Projeto › Dados do projeto**, os dados cadastrais ficam centralizados no
+sidecar e alimentam novos carimbos; carimbos existentes são sincronizados ao
+salvar as alterações.
 
 ---
 
@@ -187,6 +208,11 @@ add_linear_dimension((0,0), (10,0), (0,2))
 add_aligned_dimension((0,0), (10,5), (5,8))
 add_radius_dimension((20,0), 5, (27,2))
 
+create_block("MARCO", selected(), base=(500000, 7400000))
+insert_block("MARCO", (500010, 7400010), attributes={"ID": "M-01"})
+insert_symbol("PONTO_TOPOGRAFICO", (500020, 7400020), {"PONTO": "101"})
+wblock("biblioteca/marco.dxf", block_name="MARCO")
+
 select_all(); selected(); deselect()
 area([(0,0), (10,0), (10,10), (0,10)])       # 100.0
 azimuth((0,0), (10,0))                        # 90.0
@@ -254,7 +280,7 @@ testáveis sem abrir janela.
 pytest -q
 ```
 
-254 testes. Os que mais importam:
+319 testes. Os que mais importam:
 
 - ida e volta `mundo → tela → mundo` com coordenada UTM real (exigido < 1 mm; medido: 0);
 - zoom ancorado 60× sem deriva do ponto sob o cursor;

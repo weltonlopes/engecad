@@ -855,14 +855,23 @@ class DisplayList:
         done = 0
         upw = 2.0**level  # unidades do mundo por pixel nesta oitava
         sizes = self._size
+        layer_opacity: dict[int, int] = {}
         for i in pending:
             entity = self._ents[i]
             done += 1
             if entity is not None and entity.is_alive:
                 before = cell.verts
+                layer_id = int(layers[i])
+                opacity = layer_opacity.get(layer_id)
+                if opacity is None:
+                    props = self.doc.layer_manager.properties(self._layer_names[layer_id])
+                    opacity = int(round(255 * (1.0 - props.transparency / 100.0)))
+                    if props.locked:
+                        opacity = min(opacity, 105)
+                    layer_opacity[layer_id] = opacity
                 self._bake(
-                    cell, entity, sagitta, ox, oy, int(layers[i]), int(acis[i]),
-                    float(sizes[i]) / upw,
+                    cell, entity, sagitta, ox, oy, layer_id, int(acis[i]),
+                    float(sizes[i]) / upw, opacity,
                 )
                 self._verts += cell.verts - before
             # Entidades topograficas variam de dois a dezenas de milhares de
@@ -873,13 +882,15 @@ class DisplayList:
         del pending[:done]
 
     def _bake(self, cell: _Cell, entity, sagitta: float, ox: float, oy: float,
-              layer: int, aci: int, size_px: float) -> None:
+              layer: int, aci: int, size_px: float, opacity: int = 255) -> None:
         """Assa a entidade no tile, no detalhe que a escala do nivel comporta."""
         t = entity.dxftype()
         if t == "HATCH":
-            self._bake_hatch(cell, entity, sagitta, ox, oy, layer, aci, size_px)
+            self._bake_hatch(
+                cell, entity, sagitta, ox, oy, layer, aci, size_px, opacity
+            )
             return
-        key = (layer, aci, 255)
+        key = (layer, aci, opacity)
         if t == "ACAD_PROXY_ENTITY" and len(entity.proxy_graphic or b"") > MAX_PROXY_DETAIL_BYTES:
             # Proxies gigantes de Civil 3D podem conter malhas que o leitor
             # rapido nao reconhece. Decompo-las pelo ezdxf bloqueia o event loop
@@ -933,12 +944,13 @@ class DisplayList:
         path.lineTo(cx, cy + r)
 
     def _bake_hatch(self, cell: _Cell, hatch, sagitta: float, ox: float, oy: float,
-                    layer: int, aci: int, size_px: float) -> None:
+                    layer: int, aci: int, size_px: float, opacity: int = 255) -> None:
         try:
             alpha = int(round(255 * (1.0 - float(hatch.transparency))))
         except (TypeError, ValueError):
             alpha = 255
         alpha = max(25, min(alpha, 255))
+        alpha = min(alpha, opacity)
         solid = bool(hatch.dxf.get("solid_fill", 0))
 
         # Um padrao de hachura numa area pequena na tela nao mostra padrao

@@ -42,6 +42,7 @@ from .hatches import (
     set_hatch_seed_boundary,
     update_associative_hatch,
 )
+from .layers import LayerManager
 from .snapshot import restore, snapshot
 from .spatial_index import GridIndex
 from .undo import Command, UndoStack
@@ -191,7 +192,25 @@ class Document:
         self._dirty_all = True
         self._layer_cache: dict[str, tuple[bool, bool, int]] = {}
         self._modified = False
-        self._current_layer = "0"
+        stored_current = str(drawing.header.get("$CLAYER", "0") or "0")
+        self._current_layer = (
+            stored_current if stored_current in drawing.layers else "0"
+        )
+        self.layer_manager = LayerManager(self)
+        self.annotation_scale = 1000.0
+        self.project_attributes: dict[str, str] = {
+            "TITULO": "",
+            "PROJETO": "",
+            "CLIENTE": "",
+            "RESPONSAVEL": "",
+            "CREA_CAU": "",
+            "MUNICIPIO": "",
+            "IMOVEL": "",
+            "MATRICULA": "",
+            "FOLHA": "01/01",
+            "REVISAO": "00",
+            "CRS": self.crs.display,
+        }
         self.changed: list[Callable[[], None]] = []
         self.rebuild_index()
 
@@ -218,7 +237,9 @@ class Document:
 
     def setup_default_layers(self) -> None:
         for name, color in DEFAULT_LAYERS:
-            self.ensure_layer(name, color)
+            if name not in self.drawing.layers:
+                self.layer_manager.create(name, color=color, reconciled=True)
+        self.layer_manager.reconcile()
 
     @property
     def dimension_style_name(self) -> str:
@@ -277,13 +298,12 @@ class Document:
     @current_layer.setter
     def current_layer(self, name: str) -> None:
         self.ensure_layer(name)
-        self._current_layer = name
+        self.layer_manager.set_current(name)
 
     def ensure_layer(self, name: str, color: int = ACI_WHITE):
         if name in self.drawing.layers:
             return self.drawing.layers.get(name)
-        self.invalidate_layer_cache()
-        return self.drawing.layers.add(name, color=color)
+        return self.layer_manager.create(name, color=color)
 
     def layer_names(self) -> list[str]:
         return sorted(layer.dxf.name for layer in self.drawing.layers)
@@ -313,6 +333,18 @@ class Document:
     def layer_is_visible(self, name: str) -> bool:
         return self._layer_state(name)[0]
 
+    def layer_is_on(self, name: str) -> bool:
+        try:
+            return bool(self.drawing.layers.get(name).is_on())
+        except Exception:
+            return True
+
+    def layer_is_frozen(self, name: str) -> bool:
+        try:
+            return bool(self.drawing.layers.get(name).is_frozen())
+        except Exception:
+            return False
+
     def layer_is_locked(self, name: str) -> bool:
         return self._layer_state(name)[1]
 
@@ -320,18 +352,16 @@ class Document:
         return self._layer_state(name)[2]
 
     def set_layer_visible(self, name: str, visible: bool) -> None:
-        layer = self.drawing.layers.get(name)
-        layer.on() if visible else layer.off()
-        self.invalidate_layer_cache()
-        self._touch()
+        self.layer_manager.update(name, on=visible)
+
+    def set_layer_frozen(self, name: str, frozen: bool) -> None:
+        self.layer_manager.update(name, frozen=frozen)
+
+    def set_layer_locked(self, name: str, locked: bool) -> None:
+        self.layer_manager.update(name, locked=locked)
 
     def set_layer_color(self, name: str, aci: int) -> None:
-        self.drawing.layers.get(name).dxf.color = int(aci)
-        self.invalidate_layer_cache()
-        # A display list agrupa a geometria por cor ja resolvida: mudar a cor da
-        # camada obriga a reagrupar.
-        self.invalidate_all_geometry()
-        self._touch()
+        self.layer_manager.update(name, color=aci)
 
     # ---------------- indice espacial ----------------
 
@@ -675,6 +705,25 @@ class Document:
         from .titleblocks import add_title_block
 
         return add_title_block(self, insert, config)
+
+    def insert_block(self, name, point, options=None):
+        from .blocks import insert_block
+
+        return insert_block(self, name, point, options)
+
+    def insert_symbol(self, key, point, **kwargs):
+        from .symbols import insert_symbol
+
+        return insert_symbol(self, key, point, **kwargs)
+
+    def set_annotation_scale(self, denominator: float) -> list:
+        from .blocks import update_annotative_symbols
+
+        self.annotation_scale = max(float(denominator), 1.0)
+        changed = update_annotative_symbols(self, self.annotation_scale)
+        if not changed:
+            self._touch()
+        return changed
 
     # ---------------- edicao ----------------
 

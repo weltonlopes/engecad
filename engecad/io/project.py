@@ -45,6 +45,9 @@ def save_sidecar(ctx, dxf_path: str | Path) -> Path:
         "crs": ctx.doc.crs.srid,
         "crs_wkt": ctx.doc.crs.to_wkt(),
         "current_layer": ctx.doc.current_layer,
+        "annotation_scale": ctx.doc.annotation_scale,
+        "project_attributes": dict(ctx.doc.project_attributes),
+        "layers": ctx.doc.layer_manager.export_metadata(),
         "view": {"center": [vp.center.x, vp.center.y], "scale": vp.scale},
         "rasters": [
             {
@@ -83,6 +86,18 @@ def load_sidecar(ctx, dxf_path: str | Path) -> dict | None:
     layer = data.get("current_layer")
     if layer and layer in ctx.doc.layer_names():
         ctx.doc.current_layer = layer
+
+    try:
+        ctx.doc.annotation_scale = max(float(data.get("annotation_scale", 1000.0)), 1.0)
+    except (TypeError, ValueError):
+        ctx.doc.annotation_scale = 1000.0
+    attributes = data.get("project_attributes")
+    if isinstance(attributes, dict):
+        ctx.doc.project_attributes.update(
+            {str(key): str(value) for key, value in attributes.items()}
+        )
+    ctx.doc.project_attributes["CRS"] = ctx.doc.crs.display
+    ctx.doc.layer_manager.import_metadata(data.get("layers"))
 
     from ..render.raster_layer import RasterLayer
 

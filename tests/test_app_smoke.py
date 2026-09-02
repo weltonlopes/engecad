@@ -12,7 +12,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, Qt  # noqa: E402
-from PySide6.QtGui import QImage, QPainter  # noqa: E402
+from PySide6.QtGui import QImage, QKeySequence, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from engecad.core.geometry import Vec2  # noqa: E402
@@ -275,3 +275,68 @@ def test_mouse_click_draws_with_snap(win):
 
 def test_keyboard_shortcut_key_constants_exist():
     assert Qt.Key_Escape is not None
+
+
+def test_ribbon_exposes_every_registered_command_with_an_icon(win):
+    registered = {definition.name for definition in win.ctx.registry.definitions()}
+    assert win.ribbon.command_names == registered
+    assert win.ribbon.tabs.count() == 5
+    assert all(not action.icon().isNull() for action in win.ribbon_command_actions.values())
+
+
+def test_ribbon_also_exposes_window_and_import_actions(win):
+    expected = {
+        "NEW",
+        "OPEN",
+        "SAVE",
+        "SAVE_AS",
+        "IMPORT_RASTER",
+        "IMPORT_SHP",
+        "RASTER_INFO",
+        "PROPERTIES",
+        "LAYERS",
+        "CONSOLE",
+        "SCRIPT",
+        "CRS",
+        "RASTER_DIAG",
+        "ABOUT",
+        "EXIT",
+    }
+    assert win.ribbon.action_ids == expected
+
+
+def test_ribbon_button_dispatches_through_command_registry(win):
+    button = win.ribbon.button_for_command("LINE")
+    assert button is not None
+    button.defaultAction().trigger()
+    assert not win.ctx.idle
+    assert win.ctx.tool.name == "LINE"
+    assert button.defaultAction().isChecked()
+
+
+def test_ribbon_can_be_minimized_and_restored(win):
+    expanded_height = win.ribbon.height()
+    win.ribbon.toggle_minimized()
+    assert win.ribbon.minimized
+    assert not win.ribbon.pages.isVisible()
+    assert win.ribbon.height() < expanded_height
+    win.ribbon.toggle_minimized()
+    assert not win.ribbon.minimized
+    assert win.ribbon.pages.isVisible()
+
+
+def test_ribbon_tracks_state_changes_from_other_command_entry_points(win):
+    grade = win.ribbon_command_actions["GRADE"]
+    osnap = win.ribbon_command_actions["OSNAP"]
+    before_grid, before_snap = grade.isChecked(), osnap.isChecked()
+    win.ctx.run_command("GRADE")
+    win.ctx.run_command("OSNAP")
+    assert grade.isChecked() is not before_grid
+    assert osnap.isChecked() is not before_snap
+
+
+def test_global_shortcuts_remain_registered_after_ribbon_replaces_menu(win):
+    shortcuts = {action.shortcut() for action in win.actions() if not action.shortcut().isEmpty()}
+    assert QKeySequence("Ctrl+S") in shortcuts
+    assert QKeySequence("F3") in shortcuts
+    assert QKeySequence("Del") in shortcuts

@@ -41,8 +41,12 @@ class TitleBlockConfig:
     scale_denominator: float = 1000.0
     values: dict[str, str] = field(default_factory=dict)
 
-    def normalized_values(self) -> dict[str, str]:
-        values = {tag: str(self.values.get(tag, "")) for tag in FIELD_LABELS}
+    def normalized_values(self, project_attributes: dict | None = None) -> dict[str, str]:
+        project = project_attributes or {}
+        values = {
+            tag: str(self.values.get(tag, "") or project.get(tag, ""))
+            for tag in FIELD_LABELS
+        }
         values["ESCALA"] = values["ESCALA"] or f"1:{self.scale_denominator:g}"
         values["DATA"] = values["DATA"] or date.today().strftime("%d/%m/%Y")
         values["FOLHA"] = values["FOLHA"] or "01/01"
@@ -155,7 +159,7 @@ def add_title_block(doc, insert, config: TitleBlockConfig):
         (point.x, point.y),
         dxfattribs={"layer": doc.current_layer, "xscale": scale, "yscale": scale, "zscale": scale},
     )
-    entity.add_auto_attribs(config.normalized_values())
+    entity.add_auto_attribs(config.normalized_values(doc.project_attributes))
     if APPID not in doc.drawing.appids:
         doc.drawing.appids.new(APPID)
     metadata = {
@@ -171,8 +175,26 @@ def add_title_block(doc, insert, config: TitleBlockConfig):
 def update_title_block(doc, insert, config: TitleBlockConfig) -> None:
     if not is_title_block(insert):
         raise ValueError("a entidade selecionada nao e um carimbo do EngeCAD")
-    values = config.normalized_values()
+    values = config.normalized_values(doc.project_attributes)
     with doc.editing([insert], "editar carimbo"):
         for attrib in insert.attribs:
             if attrib.dxf.tag in values:
                 attrib.dxf.text = values[attrib.dxf.tag]
+
+
+def update_title_blocks_from_project(doc) -> int:
+    """Preenche carimbos existentes com os dados centrais do projeto."""
+    inserts = [entity for entity in doc.msp.query("INSERT") if is_title_block(entity)]
+    if not inserts:
+        return 0
+    with doc.editing(inserts, "atualizar carimbos do projeto"):
+        for insert in inserts:
+            metadata = title_block_metadata(insert)
+            values = dict(doc.project_attributes)
+            values["CRS"] = doc.crs.display
+            values["ESCALA"] = f"1:{float(metadata.get('scale_denominator', 1)):g}"
+            for attrib in insert.attribs:
+                value = values.get(attrib.dxf.tag)
+                if value not in (None, ""):
+                    attrib.dxf.text = str(value)
+    return len(inserts)
