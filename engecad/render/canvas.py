@@ -698,6 +698,8 @@ class CadCanvas(_CanvasBase):
         return True
 
     def _paint_rasters(self, painter, vp):
+        if not self.doc.is_model_layout:
+            return
         for layer in self.ctx.rasters:
             if not layer.visible:
                 continue

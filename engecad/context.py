@@ -24,6 +24,7 @@ class AppContext(QObject):
     statusMessage = Signal(str)
     toolChanged = Signal(object)
     viewChanged = Signal()
+    layoutChanged = Signal(str)
     rastersChanged = Signal()
     layerManagerRequested = Signal()
 
@@ -38,6 +39,8 @@ class AppContext(QObject):
         self._doc: Document | None = None
         self.snap: SnapEngine | None = None
         self.selection: Selection | None = None
+        #: Vista independente de cada aba de layout.
+        self._layout_views: dict[str, tuple[Vec2, float]] = {}
         #: Grip de vertice em foco no painel de propriedades (realce no canvas).
         self.vertex_focus = None
         # `doc or Document.new()` descartaria um documento vazio: Document tem
@@ -61,6 +64,7 @@ class AppContext(QObject):
     def set_document(self, doc: Document) -> None:
         self.cancel_tool()
         self._doc = doc
+        self._layout_views = {}
         self.snap = SnapEngine(doc)
         self.selection = Selection(doc)
         self.vertex_focus = None
@@ -104,6 +108,37 @@ class AppContext(QObject):
         self.set_prompt("")
         self.set_tool(None)
 
+    # ---------------- layouts ----------------
+
+    @property
+    def layout_names(self) -> list[str]:
+        return self._doc.layout_names()
+
+    def set_layout(self, name: str) -> bool:
+        """Troca a aba visível e restaura a vista que ela tinha anteriormente."""
+        actual = self._doc.resolve_layout_name(name)
+        if actual.casefold() == self._doc.current_layout.casefold():
+            return False
+
+        self.cancel_tool()
+        current = self._doc.current_layout
+        self._layout_views[current] = (self.viewport.center, self.viewport.scale)
+        self._doc.set_layout(actual)
+        self.selection.clear()
+        self.vertex_focus = None
+        self.documentChanged.emit()
+
+        saved = self._layout_views.get(self._doc.current_layout)
+        if saved is None:
+            self.zoom_extents()
+        else:
+            self.viewport.center, scale = saved
+            self.viewport.set_scale(scale)
+            self.view_changed()
+        self.layoutChanged.emit(self._doc.current_layout)
+        self.refresh()
+        return True
+
     @property
     def idle(self) -> bool:
         """Nenhum comando rodando (so a ferramenta de selecao)."""
@@ -140,13 +175,21 @@ class AppContext(QObject):
             self.canvas.update()
 
     def view_changed(self) -> None:
+        if self._doc is not None:
+            self._layout_views[self._doc.current_layout] = (
+                self.viewport.center,
+                self.viewport.scale,
+            )
         self.viewChanged.emit()
         self.refresh()
 
     def content_extents(self) -> BBox:
         b = self._doc.extents()
-        for r in self.rasters:
-            b = b.union(r.bounds)
+        # Rasters georreferenciados pertencem ao model space; não devem
+        # deslocar o enquadramento de uma folha de apresentação.
+        if self._doc.is_model_layout:
+            for r in self.rasters:
+                b = b.union(r.bounds)
         return b
 
     def zoom_extents(self) -> None:

@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QTabBar,
     QVBoxLayout,
     QWidget,
 )
@@ -73,6 +74,12 @@ class MainWindow(QMainWindow):
         self.resize(1400, 880)
 
         self.canvas = CadCanvas(self.ctx, self)
+        self.layout_tabs = QTabBar(self)
+        self.layout_tabs.setObjectName("layout_tabs")
+        self.layout_tabs.setDocumentMode(True)
+        self.layout_tabs.setExpanding(False)
+        self.layout_tabs.setMovable(False)
+        self.layout_tabs.setDrawBase(True)
         self.cmdline = CommandLine(self.ctx, self)
         self.ctx.command_line = self.cmdline
 
@@ -81,6 +88,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(self.canvas, 1)
+        lay.addWidget(self.layout_tabs)
         lay.addWidget(self.cmdline)
         self.setCentralWidget(central)
 
@@ -133,6 +141,8 @@ class MainWindow(QMainWindow):
         self.lbl_layer.setMinimumWidth(140)
         self.lbl_sel = QLabel("", self)
         self.lbl_sel.setMinimumWidth(120)
+        self.lbl_layout = QLabel("", self)
+        self.lbl_layout.setMinimumWidth(110)
         self.lbl_crs = QLabel("", self)
         for w in (
             self.lbl_coord,
@@ -140,6 +150,7 @@ class MainWindow(QMainWindow):
             self.lbl_sel,
             self.lbl_scale,
             self.lbl_layer,
+            self.lbl_layout,
             self.lbl_crs,
         ):
             sb.addPermanentWidget(w)
@@ -663,6 +674,8 @@ class MainWindow(QMainWindow):
         self.ctx.viewChanged.connect(self._on_view)
         self.ctx.toolChanged.connect(self._sync_ribbon_tool)
         self.ctx.layerManagerRequested.connect(self._show_layer_manager)
+        self.ctx.layoutChanged.connect(self._on_layout_changed)
+        self.layout_tabs.currentChanged.connect(self._on_layout_tab_changed)
         self._on_view()
         self._on_document_replaced()
         self._on_selection()
@@ -696,6 +709,44 @@ class MainWindow(QMainWindow):
         vp = self.ctx.viewport
         self.lbl_scale.setText(f"1:{vp.scale_denominator():,.0f}".replace(",", "."))
 
+    def _reload_layout_tabs(self) -> None:
+        current = self.ctx.doc.current_layout
+        self.layout_tabs.blockSignals(True)
+        try:
+            while self.layout_tabs.count():
+                self.layout_tabs.removeTab(self.layout_tabs.count() - 1)
+            for name in self.ctx.doc.layout_names():
+                self.layout_tabs.addTab(name)
+            index = next(
+                (
+                    i
+                    for i in range(self.layout_tabs.count())
+                    if self.layout_tabs.tabText(i).casefold() == current.casefold()
+                ),
+                -1,
+            )
+            if index >= 0:
+                self.layout_tabs.setCurrentIndex(index)
+        finally:
+            self.layout_tabs.blockSignals(False)
+        self.lbl_layout.setText(f"Layout: {current}")
+
+    def _on_layout_tab_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        name = self.layout_tabs.tabText(index)
+        if name.casefold() == self.ctx.doc.current_layout.casefold():
+            return
+        try:
+            self.ctx.set_layout(name)
+        except ValueError as exc:
+            self.ctx.message(str(exc))
+
+    def _on_layout_changed(self, name: str) -> None:
+        self._reload_layout_tabs()
+        self.lbl_layout.setText(f"Layout: {name}")
+        self._update_title()
+
     def _on_message(self, text: str) -> None:
         if hasattr(self, "ribbon_command_actions"):
             self.ribbon_command_actions["GRADE"].setChecked(self.canvas.show_grid)
@@ -717,16 +768,21 @@ class MainWindow(QMainWindow):
         self._on_selection()
         self.console.rebind(self.ctx)
         self.layer_panel.reload()
+        self._reload_layout_tabs()
         self._update_title()
         doc = self.ctx.doc
         self.lbl_crs.setText(doc.crs.srid)
         self.lbl_layer.setText(f"Camada: {doc.current_layer}")
+        self.lbl_layout.setText(f"Layout: {doc.current_layout}")
 
     def _update_title(self) -> None:
         doc = self.ctx.doc
         mark = "*" if doc.modified else ""
-        self.setWindowTitle(f"EngeCAD {__version__}  -  {doc.title}{mark}")
+        self.setWindowTitle(
+            f"EngeCAD {__version__}  -  {doc.title}  [{doc.current_layout}]{mark}"
+        )
         self.lbl_layer.setText(f"Camada: {doc.current_layer}")
+        self.lbl_layout.setText(f"Layout: {doc.current_layout}")
         self.lbl_crs.setText(doc.crs.srid)
 
     # ---------------- arquivo ----------------

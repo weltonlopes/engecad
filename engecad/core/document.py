@@ -179,6 +179,7 @@ class Document:
         drawing: Drawing,
         crs: ProjectCRS | None = None,
         path: str | Path | None = None,
+        layout: str | None = None,
     ):
         self.drawing = drawing
         self.crs = crs or ProjectCRS()
@@ -192,6 +193,7 @@ class Document:
         self._dirty_all = True
         self._layer_cache: dict[str, tuple[bool, bool, int]] = {}
         self._modified = False
+        self._current_layout = self.resolve_layout_name(layout or "Model")
         stored_current = str(drawing.header.get("$CLAYER", "0") or "0")
         self._current_layer = (
             stored_current if stored_current in drawing.layers else "0"
@@ -233,7 +235,10 @@ class Document:
     def open(cls, path: str | Path, crs: ProjectCRS | None = None) -> Document:
         p = Path(path)
         drawing = ezdxf.readfile(str(p))
-        return cls(drawing, crs, path=p)
+        # O sidecar do EngeCAD escolhe explicitamente o layout da ultima
+        # sessao. Sem sidecar mantemos o comportamento historico: abrir o
+        # model space, que tambem e o espaco esperado por DXFs de terceiros.
+        return cls(drawing, crs, path=p, layout="Model")
 
     def setup_default_layers(self) -> None:
         for name, color in DEFAULT_LAYERS:
@@ -269,7 +274,61 @@ class Document:
 
     @property
     def msp(self):
-        return self.drawing.modelspace()
+        """Espaco de entidades do layout atualmente selecionado.
+
+        O nome foi mantido por compatibilidade com o restante do aplicativo:
+        comandos, selecao, indice e renderizador passam a operar no layout
+        visivel sem precisar de caminhos paralelos para model/paper space.
+        """
+        return self.layout_space(self._current_layout)
+
+    @property
+    def current_layout(self) -> str:
+        return self._current_layout
+
+    @property
+    def is_model_layout(self) -> bool:
+        return self._current_layout.casefold() == "model"
+
+    def resolve_layout_name(self, name: str) -> str:
+        wanted = str(name or "Model").strip()
+        for actual in self.layout_names():
+            if actual.casefold() == wanted.casefold():
+                return actual
+        raise ValueError(f"layout inexistente: {name}")
+
+    def layout_names(self) -> list[str]:
+        """Nomes dos layouts na ordem das abas do DXF (Model primeiro)."""
+        names = list(self.drawing.layouts.names_in_taborder())
+        if not any(name.casefold() == "model" for name in names):
+            names.insert(0, "Model")
+        return names
+
+    def layout_space(self, name: str | None = None):
+        actual = self.resolve_layout_name(name or self._current_layout)
+        if actual.casefold() == "model":
+            return self.drawing.modelspace()
+        return self.drawing.layouts.get(actual)
+
+    def set_layout(self, name: str) -> bool:
+        """Seleciona um layout e reconstrói o índice do espaço visível.
+
+        A troca não é uma alteração de conteúdo e, portanto, não marca o
+        desenho como modificado. O histórico de undo é limpo porque os
+        comandos guardam entidades do espaço anterior.
+        """
+        actual = self.resolve_layout_name(name)
+        if actual.casefold() == self._current_layout.casefold():
+            return False
+        self._current_layout = actual
+        if actual.casefold() != "model":
+            # O DXF só aceita um layout de apresentação como aba ativa. Isso
+            # mantém a seleção atual coerente quando o arquivo for salvo por
+            # outra aplicação CAD.
+            self.drawing.layouts.set_active_layout(actual)
+        self.undo.clear()
+        self.rebuild_index()
+        return True
 
     @property
     def modified(self) -> bool:
