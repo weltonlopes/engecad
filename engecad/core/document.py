@@ -194,6 +194,9 @@ class Document:
         self._layer_cache: dict[str, tuple[bool, bool, int]] = {}
         self._modified = False
         self._current_layout = self.resolve_layout_name(layout or "Model")
+        #: Índices espaciais mantidos separados: trocar de aba não precisa
+        #: recalcular o bbox de um model space grande já indexado.
+        self._layout_index_cache: dict[str, tuple[GridIndex, dict[str, object]]] = {}
         stored_current = str(drawing.header.get("$CLAYER", "0") or "0")
         self._current_layer = (
             stored_current if stored_current in drawing.layers else "0"
@@ -320,14 +323,40 @@ class Document:
         actual = self.resolve_layout_name(name)
         if actual.casefold() == self._current_layout.casefold():
             return False
+        self._layout_index_cache[self._current_layout] = (self.index, self._by_handle)
         self._current_layout = actual
         if actual.casefold() != "model":
             # O DXF só aceita um layout de apresentação como aba ativa. Isso
             # mantém a seleção atual coerente quando o arquivo for salvo por
             # outra aplicação CAD.
             self.drawing.layouts.set_active_layout(actual)
+
+        cached = self._layout_index_cache.get(actual)
+        if cached is not None:
+            # Scripts que usam ezdxf diretamente podem inserir/remover
+            # entidades sem passar pelos métodos do Document. A contagem é
+            # uma verificação O(1) no BlockLayout e evita reutilizar um cache
+            # obviamente desatualizado sem voltar a varrer um arquivo grande.
+            try:
+                if len(self.layout_space(actual)) != len(cached[1]):
+                    cached = None
+                    self._layout_index_cache.pop(actual, None)
+            except TypeError:
+                cached = None
+        if cached is None:
+            # Layouts criados depois da abertura do documento ainda não têm
+            # cache; somente a primeira visita paga a indexação completa.
+            self.index = GridIndex()
+            self._by_handle = {}
+            self._layer_cache = {}
+            self.rebuild_index()
+        else:
+            self.index, self._by_handle = cached
+            self._layer_cache = {}
+            self._dirty_all = True
+            self._dirty_handles.clear()
+            self.geometry_revision += 1
         self.undo.clear()
-        self.rebuild_index()
         return True
 
     @property
@@ -442,6 +471,7 @@ class Document:
         self._dirty_all = True
         self._dirty_handles.clear()
         self.geometry_revision += 1
+        self._layout_index_cache[self._current_layout] = (self.index, self._by_handle)
 
     def _mark_dirty(self, handle: str) -> None:
         """Sinaliza que a geometria da entidade mudou.
