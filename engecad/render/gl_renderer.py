@@ -47,6 +47,7 @@ GL_CULL_FACE = 0x0B44
 GL_SRC_ALPHA = 0x0302
 GL_ONE_MINUS_SRC_ALPHA = 0x0303
 GL_COLOR_BUFFER_BIT = 0x00004000
+GL_MULTISAMPLE = 0x809D
 
 # 16 e potencia de dois: a parcela alta e representavel exatamente em float32
 # para toda coordenada terrestre usual, enquanto a baixa ganha resolucao
@@ -535,6 +536,10 @@ class OpenGLRenderer:
         self.context = context
         self.functions = context.functions()
         self.functions.initializeOpenGLFunctions()
+        # O QOpenGLWidget fornece o framebuffer multisample solicitado pelo
+        # canvas; esta chamada habilita a cobertura por amostra para as linhas
+        # vetoriais desenhadas pelos VBOs.
+        self.functions.glEnable(GL_MULTISAMPLE)
         # Qt 6.9 ainda nao fornece a classe versionada 4.6 em todas as builds,
         # embora o driver anuncie 4.6. MultiDraw pertence ao desktop GL 1.4,
         # entao pedimos exatamente essa interface e caimos no loop portavel em

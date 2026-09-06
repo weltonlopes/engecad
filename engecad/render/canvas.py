@@ -148,10 +148,11 @@ class CadCanvas(_CanvasBase):
     def __init__(self, ctx, parent=None):
         super().__init__(parent)
         if _OPENGL_CANVAS:
-            # Sem MSAA: linhas CAD de 1 px ja sao filtradas pelo compositor e
-            # quatro amostras quadruplicariam fill-rate nos arquivos densos.
+            # Solicita MSAA no framebuffer do QOpenGLWidget. A geometria chega
+            # como GL_LINES, portanto o antialiasing precisa acontecer nas
+            # amostras do framebuffer e nao no QPainter de sobreposicao.
             surface = QSurfaceFormat(self.format())
-            surface.setSamples(0)
+            surface.setSamples(4)
             surface.setDepthBufferSize(0)
             surface.setStencilBufferSize(0)
             surface.setSwapInterval(0)
