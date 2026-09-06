@@ -1,11 +1,29 @@
 import pytest
 
 from engecad.core.document import Document
+from engecad.core.entities import entity_snap_points
 from engecad.core.geometry import Vec2
 from engecad.render.viewport import Viewport
 from engecad.snap.engine import SnapEngine
 
 E, N = 500000.0, 7400000.0
+
+
+def test_lwpolyline_snap_uses_real_vertices_and_true_bulge_midpoint():
+    doc = Document.new()
+    entity = doc.msp.add_lwpolyline([(0, 0, 1.0), (10, 0, 0.0)], format="xyb")
+
+    points = entity_snap_points(entity)
+
+    assert len(points) == 3  # dois vertices e um meio, sem pontos de tessellacao
+    midpoint = next(point for kind, point in points if kind == "mid")
+    assert midpoint.x == pytest.approx(5.0)
+    assert midpoint.y == pytest.approx(-5.0)
+
+    cloud = SnapEngine._lwpolyline_cloud(entity)
+    assert cloud.size == 3
+    assert cloud.xs[-1] == pytest.approx(midpoint.x)
+    assert cloud.ys[-1] == pytest.approx(midpoint.y)
 
 
 @pytest.fixture
@@ -111,3 +129,16 @@ def test_grid_snap_only_when_nothing_else():
     r = snap.snap(Vec2(E + 0.2, N + 0.1), vp)
     assert r.kind == "grid"
     assert r.point.x == pytest.approx(E)
+
+
+def test_prewarm_builds_large_polyline_cloud_before_first_hover():
+    doc = Document.new("EPSG:31982")
+    polyline = doc.add_lwpolyline([(float(i), float(i % 7)) for i in range(1_100)])
+    snap = SnapEngine(doc)
+
+    snap.start_prewarm()
+    while not snap.prewarm_step(1_000.0):
+        pass
+
+    cloud = snap._points[polyline.dxf.handle]
+    assert cloud.size == 2_199  # vertices + meios dos 1.099 segmentos

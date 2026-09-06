@@ -18,21 +18,48 @@ desenho inteiro so para mover a cruz do cursor.
 from __future__ import annotations
 
 import math
+import os
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QCursor,
+    QFont,
+    QFontMetricsF,
+    QPainter,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QStaticText,
+    QSurfaceFormat,
+)
 from PySide6.QtWidgets import QWidget
 
+try:
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+except ImportError:  # instalacoes Qt deliberadamente sem o modulo OpenGL
+    QOpenGLWidget = None
+
 from ..core.dimensions import DIMENSION_TYPES
-from ..core.entities import POINT_LIKE, entity_insert_point, entity_point_lists, entity_primitives
+from ..core.entities import (
+    MAX_INTERACTIVE_PROXY_BYTES,
+    POINT_LIKE,
+    entity_insert_point,
+    entity_point_lists,
+    entity_primitives,
+)
 from ..core.geometry import Vec2, decimate
 from ..core.picking import probe_at
 from .displaylist import DisplayList
 from .framecache import FrameCache
 from .styles import DARK, aci_to_qcolor
 
-ZOOM_STEP = 1.18
+# Um entalhe comum da roda aproxima/afasta 35%. O valor anterior (18%) exigia
+# muitas voltas para navegar entre a vista geral e o detalhe de um DXF extenso.
+ZOOM_STEP = 1.35
 CROSSHAIR_GAP = 7  # px do quadradinho central
+CROSSHAIR_RADIUS = 28  # alcance de cada braco a partir do centro
 PICKBOX = 6  # meio-lado do quadradinho de selecao, em px
 MAX_GRID_LINES = 400
 
@@ -44,10 +71,32 @@ REFINE_MS = 70  # espera antes do redesenho fino, em ms
 # canvas devolver o controle ao Qt antes de a interface parecer travada.
 STEP_BUDGET_MS = 12.0
 FIRST_STEP_BUDGET_MS = 60.0  # a primeira fatia acomoda um desenho comum inteiro
+SNAP_WARM_SLICE_MS = 4.0
 MAX_OUTLINES = 2_000  # contornos de selecao/realce desenhados por quadro
 MAX_OUTLINE_VERTS = 20_000
 POINTER_INTERVAL_MS = 8  # no maximo 125 resolucoes de snap/hover por segundo
 TEXT_TYPES = {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}
+MAX_STATIC_TEXTS = 4_096
+
+
+def _use_opengl_widget() -> bool:
+    """Seleciona OpenGL em tela real e conserva o QWidget em testes/headless."""
+    requested = os.environ.get("ENGECAD_RENDERER", "auto").strip().lower()
+    if requested in {"cpu", "qpainter", "software"} or QOpenGLWidget is None:
+        return False
+    platform = os.environ.get("QT_QPA_PLATFORM", "").strip().lower()
+    if requested != "opengl" and platform in {"offscreen", "minimal", "minimalegl"}:
+        return False
+    return True
+
+
+_OPENGL_CANVAS = _use_opengl_widget()
+_CanvasBase = QOpenGLWidget if _OPENGL_CANVAS else QWidget
+if _OPENGL_CANVAS:
+    from .gl_renderer import BUILD_SLICE_MS, GpuGeometry, OpenGLRenderer
+else:
+    BUILD_SLICE_MS = 0.0
+    GpuGeometry = OpenGLRenderer = None
 
 
 class _PointerAt:
@@ -66,18 +115,53 @@ class _PointerAt:
         return self._pos
 
 
-class CadCanvas(QWidget):
+class _OverlayWidget(QWidget):
+    """Camada Qt transparente acima do framebuffer OpenGL.
+
+    Cursor, snap, grips e previas mudam centenas de vezes por segundo, mas a
+    geometria quase sempre permanece identica. Um widget filho permite mover
+    esses elementos sem agendar outro ``paintGL`` para todos os VBOs da cena.
+    """
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._canvas = canvas
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
+        painter.fillRect(event.rect(), Qt.transparent)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        self._canvas._paint_overlays(painter)
+        painter.end()
+
+
+class CadCanvas(_CanvasBase):
     coordinateMoved = Signal(object)  # Vec2 no CRS do projeto
     snapChanged = Signal(object)  # SnapResult | None
     viewChanged = Signal()
 
     def __init__(self, ctx, parent=None):
         super().__init__(parent)
+        if _OPENGL_CANVAS:
+            # Sem MSAA: linhas CAD de 1 px ja sao filtradas pelo compositor e
+            # quatro amostras quadruplicariam fill-rate nos arquivos densos.
+            surface = QSurfaceFormat(self.format())
+            surface.setSamples(0)
+            surface.setDepthBufferSize(0)
+            surface.setStencilBufferSize(0)
+            surface.setSwapInterval(0)
+            self.setFormat(surface)
+            self.setUpdateBehavior(QOpenGLWidget.UpdateBehavior.NoPartialUpdate)
         self.ctx = ctx
         ctx.canvas = self
         self.theme = DARK
         self._show_grid = True
-        self.show_crosshair = True
+        self._show_crosshair = True
 
         self._cursor_screen: QPointF | None = None
         self._cursor_world: Vec2 | None = None
@@ -87,6 +171,22 @@ class CadCanvas(QWidget):
 
         self._display = DisplayList(ctx.doc)
         self._frame = FrameCache()
+        self._gpu_geometry = GpuGeometry(ctx.doc) if _OPENGL_CANVAS else None
+        self._gpu_renderer = None
+        self._gpu_error: str | None = None
+        self._gpu_build = QTimer(self)
+        self._gpu_build.setSingleShot(True)
+        self._gpu_build.setInterval(0)
+        self._gpu_build.timeout.connect(self._advance_gpu)
+        if self._gpu_geometry is not None:
+            self._gpu_build.start()
+        self._snap_warm = QTimer(self)
+        self._snap_warm.setSingleShot(True)
+        self._snap_warm.setInterval(0)
+        self._snap_warm.timeout.connect(self._advance_snap_warm)
+        self._snap_warm_revision = -1
+        if self._gpu_geometry is None:
+            self._start_snap_warm()
         self._interactive = False
         self._sel_key: tuple | None = None
         self._sel_outlines: list = []
@@ -109,6 +209,7 @@ class CadCanvas(QWidget):
         self._pointer.timeout.connect(self._resolve_pointer)
         self._hover_key: tuple | None = None
         self._hover_shapes: list = []
+        self._static_texts: dict[tuple[str, int, str], tuple[QStaticText, float]] = {}
         ctx.documentReplaced.connect(self._on_document_replaced)
         # Qualquer mutacao do documento (geometria, cor ou visibilidade de
         # camada) invalida o quadro guardado; a display list so reconstroi os
@@ -118,13 +219,32 @@ class CadCanvas(QWidget):
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setCursor(Qt.BlankCursor)  # desenhamos a mira nos mesmos
         self.setAutoFillBackground(False)
+        self._overlay = _OverlayWidget(self) if _OPENGL_CANVAS else None
+        if self._overlay is not None:
+            self._overlay.setGeometry(self.rect())
+            self._overlay.show()
+            self._overlay.raise_()
+        self._apply_native_cursor()
+
+    def update(self, *args) -> None:
+        """Atualiza a cena e mantem o overlay sincronizado com atualizacoes externas."""
+        super().update(*args)
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            overlay.update(*args)
 
     # ---------------- invalidacao da cena ----------------
 
     def _on_document_replaced(self) -> None:
         self._display = DisplayList(self.ctx.doc)
+        self._snap_warm.stop()
+        self._snap_warm_revision = -1
+        if self._gpu_geometry is not None:
+            self._gpu_geometry.start(self.ctx.doc)
+            self._gpu_build.start()
+        else:
+            self._start_snap_warm()
         self._pointer_probe = None
         self._hover_key = None
         self._hover_shapes = []
@@ -133,7 +253,44 @@ class CadCanvas(QWidget):
     def invalidate_scene(self) -> None:
         """Descarta o quadro guardado. A geometria em si so e refeita se mudou."""
         self._frame.invalidate()
+        if self._gpu_geometry is not None and self._gpu_geometry.ensure_current():
+            self._gpu_build.start()
+        self._update_scene_and_overlay()
+
+    def _update_overlay(self) -> None:
+        """Invalida somente a camada interativa quando ela esta separada."""
+        if self._overlay is not None:
+            self._overlay.update()
+        else:
+            self.update()
+
+    def _update_scene_and_overlay(self) -> None:
         self.update()
+
+    def _advance_gpu(self) -> None:
+        """Prepara VBOs sem monopolizar a thread da interface."""
+        geometry = self._gpu_geometry
+        if geometry is None:
+            return
+        if not geometry.advance(BUILD_SLICE_MS):
+            self._gpu_build.start()
+        else:
+            self._start_snap_warm()
+        self.update()
+
+    def _start_snap_warm(self) -> None:
+        engine = self.ctx.snap
+        revision = self.doc.geometry_revision
+        if engine is None or self._snap_warm_revision == revision:
+            return
+        self._snap_warm_revision = revision
+        engine.start_prewarm()
+        self._snap_warm.start()
+
+    def _advance_snap_warm(self) -> None:
+        engine = self.ctx.snap
+        if engine is not None and not engine.prewarm_step(SNAP_WARM_SLICE_MS):
+            self._snap_warm.start()
 
     def _finish_gesture(self) -> None:
         self._interactive = False
@@ -161,12 +318,52 @@ class CadCanvas(QWidget):
         """Snap que originou o ponto efetivo atual, para ferramentas associativas."""
         return self._snap
 
+    def _apply_native_cursor(self) -> None:
+        """Instala a mira como cursor do sistema, fora do ciclo de pintura Qt."""
+        if self._panning:
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        if not self.show_crosshair:
+            self.setCursor(Qt.ArrowCursor)
+            return
+
+        margin = CROSSHAIR_RADIUS + 4
+        size = margin * 2 + 1
+        center = margin
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        pen = QPen(self.theme.q("crosshair"), 1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        radius = CROSSHAIR_RADIUS
+        gap = CROSSHAIR_GAP
+        painter.drawLine(QPointF(center - radius, center), QPointF(center - gap, center))
+        painter.drawLine(QPointF(center + gap, center), QPointF(center + radius, center))
+        painter.drawLine(QPointF(center, center - radius), QPointF(center, center - gap))
+        painter.drawLine(QPointF(center, center + gap), QPointF(center, center + radius))
+        painter.setPen(QPen(self.theme.q("cursor_box"), 1))
+        painter.drawRect(
+            QRectF(
+                center - PICKBOX,
+                center - PICKBOX,
+                2 * PICKBOX,
+                2 * PICKBOX,
+            )
+        )
+        painter.end()
+        self.setCursor(QCursor(pixmap, center, center))
+
     # ---------------- eventos de janela ----------------
 
     def resizeEvent(self, ev):
         self.vp.resize(self.width(), self.height())
         self._frame.invalidate()
         super().resizeEvent(ev)
+        if self._overlay is not None:
+            self._overlay.setGeometry(self.rect())
+            self._overlay.raise_()
 
     # ---------------- ponteiro ----------------
 
@@ -195,7 +392,7 @@ class CadCanvas(QWidget):
         self.coordinateMoved.emit(self.effective_point())
         if tool is not None:
             tool.on_mouse_move(self.effective_point(), _PointerAt(self._cursor_screen))
-        self.update()
+        self._update_overlay()
 
     # ---------------- mouse ----------------
 
@@ -207,7 +404,7 @@ class CadCanvas(QWidget):
             self._pan_anchor = pos
             self._interactive = True
             self._emit_view_changed()
-            self.update()
+            self._update_scene_and_overlay()
             return
 
         self._cursor_screen = pos
@@ -239,13 +436,13 @@ class CadCanvas(QWidget):
             tool.on_click(p, ev)
         elif ev.button() == Qt.RightButton:
             tool.on_right_click(p, ev)
-        self.update()
+        self._update_overlay()
 
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.MiddleButton and self._panning:
             self._panning = False
             self._pan_anchor = None
-            self.setCursor(Qt.BlankCursor)
+            self._apply_native_cursor()
             if self._interactive:  # o gesto acabou: refina agora
                 self._finish_gesture()
             return
@@ -255,13 +452,17 @@ class CadCanvas(QWidget):
             p = self.effective_point()
             if tool is not None and p is not None:
                 tool.on_release(p, ev)
-                self.update()
+                self._update_overlay()
 
     def wheelEvent(self, ev):
         delta = ev.angleDelta().y()
         if delta == 0:
             return
-        factor = ZOOM_STEP if delta > 0 else 1 / ZOOM_STEP
+        # 120 unidades correspondem a um entalhe de uma roda tradicional.
+        # Respeitar a magnitude mantem trackpads/rodas de alta resolucao suaves,
+        # enquanto o expoente torna varios entalhes acumulados consistentes.
+        steps = max(-4.0, min(4.0, delta / 120.0))
+        factor = ZOOM_STEP**steps
         pos = ev.position()
         self.vp.zoom_at_screen(pos.x(), pos.y(), factor)
         self._cursor_screen = pos
@@ -273,16 +474,16 @@ class CadCanvas(QWidget):
         if not self._pointer.isActive():
             self._pointer.start()
         self._emit_view_changed()
-        self.update()
+        self._update_scene_and_overlay()
 
     def keyPressEvent(self, ev):
         tool = self.ctx.tool
         if tool is not None and tool.on_key(ev.key(), ev.modifiers()):
-            self.update()
+            self._update_overlay()
             return
         if ev.key() == Qt.Key_Escape:
             self.ctx.cancel_tool()
-            self.update()
+            self._update_overlay()
             return
 
         # Como no AutoCAD: digitar com o foco no desenho cai na linha de
@@ -304,7 +505,7 @@ class CadCanvas(QWidget):
         self._cursor_screen = None
         self._snap = None
         self._pointer_probe = None
-        self.update()
+        self._update_overlay()
         super().leaveEvent(ev)
 
     def _emit_view_changed(self):
@@ -317,8 +518,18 @@ class CadCanvas(QWidget):
     # ---------------- desenho ----------------
 
     def paintEvent(self, ev):
+        if _OPENGL_CANVAS:
+            # QOpenGLWidget controla o FBO e chama paintGL. Sobrescrever o
+            # paintEvent sem este desvio impediria a composicao do OpenGL.
+            return super().paintEvent(ev)
         painter = QPainter(self)
         self._draw_scene(painter)
+
+        self._paint_overlays(painter)
+        painter.end()
+
+    def _paint_overlays(self, painter) -> None:
+        """Desenha a camada pequena e dinamica comum aos dois backends."""
 
         painter.setRenderHint(QPainter.Antialiasing, False)
         self._paint_hover(painter)
@@ -333,9 +544,93 @@ class CadCanvas(QWidget):
         self._paint_grips(painter)
         self._paint_vertex_focus(painter)
         self._paint_snap(painter)
-        if self.show_crosshair:
-            self._paint_cursor(painter)
+
+    # ---------------- backend OpenGL ----------------
+
+    def initializeGL(self) -> None:
+        if not _OPENGL_CANVAS:
+            return
+        try:
+            self._gpu_renderer = OpenGLRenderer(self.context())
+            self.context().aboutToBeDestroyed.connect(self._destroy_gl)
+        except (RuntimeError, AttributeError) as exc:
+            self._gpu_error = str(exc)
+            self._gpu_renderer = None
+            self.ctx.message(f"OpenGL indisponivel; usando QPainter: {exc}")
+
+    def paintGL(self) -> None:
+        """Compoe base Qt, vetores GPU e overlays Qt no mesmo framebuffer."""
+        renderer = self._gpu_renderer
+        geometry = self._gpu_geometry
+        if renderer is None or geometry is None:
+            self._paint_cpu_on_current_surface()
+            return
+
+        renderer.request(geometry.snapshot)
+        try:
+            complete = renderer.upload_step()
+        except RuntimeError as exc:
+            self._gpu_error = str(exc)
+            self._gpu_renderer = None
+            self.ctx.message(f"Falha ao enviar geometria para a GPU: {exc}")
+            self._paint_cpu_on_current_surface()
+            return
+        if not complete:
+            self.update()
+
+        snapshot = renderer.active_snapshot
+        if geometry.snapshot is None:
+            # Troca de documento: jamais mostre os VBOs do arquivo anterior.
+            snapshot = None
+        if snapshot is None:
+            # O primeiro upload e incremental. O cache CPU mantem o arquivo
+            # utilizavel enquanto os VBOs sao montados.
+            self._paint_cpu_on_current_surface()
+            return
+
+        dpr = self.devicePixelRatioF()
+        renderer.clear(self.theme.q("background"), self.vp, dpr)
+        painter = QPainter(self)
+        self._paint_rasters(painter, self.vp)
+        if self.show_grid:
+            self._paint_grid(painter, self.vp)
+        geometry.paint_fills(painter, snapshot, self.vp, self.theme is DARK)
+        painter.beginNativePainting()
+        renderer.draw(
+            self.vp,
+            self.doc,
+            self.theme is DARK,
+            dpr,
+        )
+        painter.endNativePainting()
+        geometry.paint_placeholders(painter, snapshot, self.vp, self.theme is DARK)
+        markers = geometry.visible_markers(snapshot, self.vp)
+        if markers:
+            self._paint_markers(painter, self.vp, markers)
         painter.end()
+
+    def _destroy_gl(self) -> None:
+        renderer = self._gpu_renderer
+        if renderer is None:
+            return
+        self.makeCurrent()
+        renderer.destroy()
+        self.doneCurrent()
+
+    def _paint_cpu_on_current_surface(self) -> None:
+        painter = QPainter(self)
+        self._draw_scene(painter)
+        if self._overlay is None:
+            self._paint_overlays(painter)
+        painter.end()
+
+    @property
+    def renderer_name(self) -> str:
+        if not _OPENGL_CANVAS:
+            return "QPainter"
+        if self._gpu_renderer is None:
+            return "QPainter (fallback OpenGL)"
+        return "OpenGL/VBO"
 
     # ---------------- cena (rasters + grade + geometria) ----------------
 
@@ -456,6 +751,8 @@ class CadCanvas(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
         font = QFont(painter.font())
         colors: dict[str, int] = {}
+        pens: dict[int, QPen] = {}
+        last_aci = None
         for e in entities:
             if not e.is_alive:
                 continue
@@ -467,9 +764,14 @@ class CadCanvas(QWidget):
                     aci = colors[layer] = doc.layer_color(layer)
             else:
                 aci = color
-            pen = QPen(aci_to_qcolor(aci, dark), 1.2)
-            pen.setCosmetic(True)
-            painter.setPen(pen)
+            if aci != last_aci:
+                pen = pens.get(aci)
+                if pen is None:
+                    pen = QPen(aci_to_qcolor(aci, dark), 1.2)
+                    pen.setCosmetic(True)
+                    pens[aci] = pen
+                painter.setPen(pen)
+                last_aci = aci
 
             t = e.dxftype()
             if t == "POINT":
@@ -516,16 +818,33 @@ class CadCanvas(QWidget):
         else:
             text = entity.dxf.get("text", "")
         rotation = float(entity.dxf.get("rotation", 0.0) or 0.0)
+        rendered, ascent = self._static_text(str(text), font)
         painter.save()
         painter.translate(sx, sy)
         painter.rotate(-rotation)
         if centered:
             # As cotas do ezdxf usam ponto de anexacao central para o MTEXT.
-            half = max(30.0, len(str(text)) * px)
-            painter.drawText(QRectF(-half, -px, half * 2, px * 2), Qt.AlignCenter, str(text))
+            size = rendered.size()
+            painter.drawStaticText(QPointF(-size.width() * 0.5, -size.height() * 0.5), rendered)
         else:
-            painter.drawText(QPointF(0, 0), str(text))
+            # drawText usa a origem como baseline; QStaticText usa topo/esquerda.
+            painter.drawStaticText(QPointF(0, -ascent), rendered)
         painter.restore()
+
+    def _static_text(self, text: str, font: QFont) -> tuple[QStaticText, float]:
+        """Cacheia layout e glifos; pan nao volta a analisar cada string DXF."""
+        key = (text, font.pixelSize(), font.family())
+        hit = self._static_texts.get(key)
+        if hit is not None:
+            return hit
+        if len(self._static_texts) >= MAX_STATIC_TEXTS:
+            self._static_texts.clear()
+        rendered = QStaticText(text)
+        rendered.setPerformanceHint(QStaticText.AggressiveCaching)
+        rendered.prepare(font=font)
+        hit = (rendered, QFontMetricsF(font).ascent())
+        self._static_texts[key] = hit
+        return hit
 
     def _paint_hover(self, painter):
         """Realce leve da entidade sob o cursor, antes de clicar."""
@@ -615,6 +934,16 @@ class CadCanvas(QWidget):
     def _outline_shapes(self, entity, tol) -> list:
         """Formas de tela que contornam a entidade: poligonais ou um quadradinho."""
         vp = self.vp
+        if (
+            entity.dxftype() == "ACAD_PROXY_ENTITY"
+            and len(entity.proxy_graphic or b"") > MAX_INTERACTIVE_PROXY_BYTES
+        ):
+            box = self.doc.index._boxes.get(entity.dxf.get("handle"))
+            if box is None or box.is_empty:
+                return []
+            x0, y1 = vp.world_to_screen_xy(box.minx, box.miny)
+            x1, y0 = vp.world_to_screen_xy(box.maxx, box.maxy)
+            return [QRectF(QPointF(x0, y0), QPointF(x1, y1)).normalized()]
         if entity.dxftype() in POINT_LIKE:
             p = entity_insert_point(entity)
             if p is None:
@@ -732,29 +1061,26 @@ class CadCanvas(QWidget):
         painter.setPen(self.theme.q("snap_text"))
         painter.drawText(QPointF(sx + 12, sy + 18), self._snap.label)
 
-    def _paint_cursor(self, painter):
-        if self._cursor_screen is None:
-            return
-        x, y = self._cursor_screen.x(), self._cursor_screen.y()
-        pen = QPen(self.theme.q("crosshair"), 1)
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-        painter.drawLine(QPointF(0, y), QPointF(x - CROSSHAIR_GAP, y))
-        painter.drawLine(QPointF(x + CROSSHAIR_GAP, y), QPointF(self.width(), y))
-        painter.drawLine(QPointF(x, 0), QPointF(x, y - CROSSHAIR_GAP))
-        painter.drawLine(QPointF(x, y + CROSSHAIR_GAP), QPointF(x, self.height()))
-        painter.setPen(QPen(self.theme.q("cursor_box"), 1))
-        painter.drawRect(QRectF(x - PICKBOX, y - PICKBOX, 2 * PICKBOX, 2 * PICKBOX))
-
     # ---------------- utilidades de vista ----------------
 
     def zoom_extents(self):
         self.ctx.zoom_extents()
-        self.update()
+        self._update_scene_and_overlay()
 
     def set_theme(self, theme):
         self.theme = theme
+        self._apply_native_cursor()
         self.invalidate_scene()
+
+    @property
+    def show_crosshair(self) -> bool:
+        return self._show_crosshair
+
+    @show_crosshair.setter
+    def show_crosshair(self, on: bool) -> None:
+        self._show_crosshair = bool(on)
+        if hasattr(self, "theme"):
+            self._apply_native_cursor()
 
     @property
     def show_grid(self) -> bool:

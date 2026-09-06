@@ -18,6 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from ezdxf import bbox as ezbbox  # noqa: E402
 from ezdxf.path import make_path  # noqa: E402
+from PySide6.QtCore import QPointF  # noqa: E402
 from PySide6.QtGui import QImage, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -71,6 +72,24 @@ def _ink(canvas, w=400, h=300):
         for x in range(w)
         if img.pixel(x, y) & 0xFFFFFF != background & 0xFFFFFF
     )
+
+
+def test_crosshair_is_a_compact_native_cursor(qapp):
+    ctx = AppContext(Document.new())
+    canvas = CadCanvas(ctx)
+    cursor = canvas.cursor()
+    pixmap = cursor.pixmap()
+    image = pixmap.toImage()
+    center = cursor.hotSpot()
+    crosshair = canvas.theme.q("crosshair").rgb()
+
+    assert not pixmap.isNull()
+    assert pixmap.width() <= 65 and pixmap.height() <= 65
+    assert center == QPointF(32, 32).toPoint()
+    assert image.pixelColor(0, center.y()).alpha() == 0
+    assert image.pixel(center.x() - 20, center.y()) == crosshair
+    assert image.pixel(center.x(), center.y() - 20) == crosshair
+    canvas.deleteLater()
 
 
 # ---------------- achatamento rapido ----------------

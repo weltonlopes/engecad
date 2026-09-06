@@ -13,6 +13,8 @@ from collections import OrderedDict
 
 import numpy as np
 from ezdxf import bbox as ezbbox
+from ezdxf.fonts import fonts as ezfonts
+from ezdxf.fonts.font_manager import DEFAULT_FONTS, FontNotFoundError
 from ezdxf.path import from_hatch_boundary_path, make_path
 
 from .dimensions import DIMENSION_TYPES, dimension_primitives
@@ -34,9 +36,37 @@ _MAX_PRIMITIVE_CACHE = 30_000
 _primitive_cache: dict[str, list] = {}
 _MAX_PROXY_CACHE = 8_192
 _proxy_cache: OrderedDict[str, list[list[tuple[float, float]]] | None] = OrderedDict()
+MAX_INTERACTIVE_PROXY_BYTES = 30_000
 _MAX_POLYLINE_POINTS = 1_000_000
 _polyline_cache: OrderedDict[str, list[tuple[float, float, float]]] = OrderedDict()
 _polyline_points = 0
+
+
+def _repair_stale_font_fallback() -> None:
+    """Evita milhares de tentativas de abrir uma fonte removida do Windows.
+
+    O cache global do ezdxf pode conservar ``ArialUni.ttf`` mesmo depois que a
+    fonte deixa de existir. Cada cota/bloco tenta abri-la novamente e registra
+    um warning, o que domina o carregamento de arquivos com muito texto.
+    """
+    manager = ezfonts.font_manager
+    try:
+        manager.get_ttf_font(manager.fallback_font_name())
+        return
+    except FontNotFoundError:
+        pass
+    for name in DEFAULT_FONTS[1:]:
+        if not manager.has_font(name):
+            continue
+        manager._fallback_font_name = name
+        try:
+            manager.get_ttf_font(name)
+            return
+        except FontNotFoundError:
+            continue
+
+
+_repair_stale_font_fallback()
 
 
 def entity_primitives(entity) -> list:
@@ -612,6 +642,24 @@ def entity_snap_points(entity) -> list[tuple[str, Vec2]]:
         out.append(("mid", Vec2.polar(c, (a0 + a1) / 2, r)))
         return out
 
+    if t == "LWPOLYLINE" and _is_plan(entity):
+        # Pontos de snap sao os vertices DXF reais, nao os milhares de pontos
+        # artificiais criados para rasterizar um arco com bulge. Alem de mais
+        # correto, isto evita picos de centenas de ms em eixos rodoviarios.
+        handle = dxf.get("handle")
+        raw = _polyline_cache.get(handle) if handle is not None else None
+        if raw is None:
+            raw = [(p[0], p[1], p[4]) for p in entity.lwpoints]
+        if not raw:
+            return out
+        out.extend(("end", Vec2(p[0], p[1])) for p in raw)
+        pairs = list(zip(raw, raw[1:], strict=False))
+        if entity.closed and len(raw) > 1:
+            pairs.append((raw[-1], raw[0]))
+        for start, end in pairs:
+            out.append(("mid", _bulge_midpoint(start, end)))
+        return out
+
     if t in POINT_LIKE:
         p = entity_insert_point(entity)
         if p:
@@ -630,6 +678,25 @@ def entity_snap_points(entity) -> list[tuple[str, Vec2]]:
             if i + 1 < len(poly):
                 out.append(("mid", (p + poly[i + 1]) * 0.5))
     return out
+
+
+def _bulge_midpoint(start, end) -> Vec2:
+    """Ponto medio do segmento reto ou circular de uma LWPOLYLINE."""
+    x0, y0, bulge = start
+    x1, y1 = end[0], end[1]
+    if abs(bulge) <= 1e-15:
+        return Vec2((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+    dx, dy = x1 - x0, y1 - y0
+    chord = math.hypot(dx, dy)
+    if chord <= 1e-15:
+        return Vec2(x0, y0)
+    theta = 4.0 * math.atan(bulge)
+    offset = chord * (1.0 - bulge * bulge) / (4.0 * bulge)
+    cx = (x0 + x1) * 0.5 - dy / chord * offset
+    cy = (y0 + y1) * 0.5 + dx / chord * offset
+    angle = math.atan2(y0 - cy, x0 - cx) + theta * 0.5
+    radius = chord * (1.0 + bulge * bulge) / (4.0 * abs(bulge))
+    return Vec2(cx + radius * math.cos(angle), cy + radius * math.sin(angle))
 
 
 def entity_summary(entity) -> str:

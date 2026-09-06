@@ -897,7 +897,9 @@ class DisplayList:
             # por 50-200 ms por entidade. Se houver polilinhas suportadas elas
             # seguem pelo caminho normal; caso contrario usamos a marca de bbox.
             if _proxy_points(entity) is None:
-                self._bake_mark(cell.stroke(key, 4), entity, ox, oy)
+                self._bake_mark(
+                    cell.stroke(key, 4), entity, ox, oy, radius=10.0 * sagitta
+                )
                 cell.verts += 4
                 return
         if t == "INSERT" and size_px < BLOCK_DETAIL_MIN_PX:
@@ -930,14 +932,21 @@ class DisplayList:
                 break
             at = stop - 1
 
-    def _bake_mark(self, path: QPainterPath, entity, ox: float, oy: float) -> None:
+    def _bake_mark(
+        self,
+        path: QPainterPath,
+        entity,
+        ox: float,
+        oy: float,
+        radius: float | None = None,
+    ) -> None:
         """Cruz do tamanho da entidade, no lugar do desenho dela."""
         i = self._slot.get(entity.dxf.get("handle"))
         if i is None:
             return
         minx, miny, maxx, maxy = self._bbox[i]
         cx, cy = (minx + maxx) * 0.5 - ox, (miny + maxy) * 0.5 - oy
-        r = max(maxx - minx, maxy - miny) * 0.5
+        r = radius if radius is not None else max(maxx - minx, maxy - miny) * 0.5
         path.moveTo(cx - r, cy)
         path.lineTo(cx + r, cy)
         path.moveTo(cx, cy - r)
