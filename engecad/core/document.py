@@ -194,6 +194,7 @@ class Document:
         self._layer_cache: dict[str, tuple[bool, bool, int]] = {}
         self._modified = False
         self._current_layout = self.resolve_layout_name(layout or "Model")
+        self._layout_revisions: dict[str, int] = {}
         #: Índices espaciais mantidos separados: trocar de aba não precisa
         #: recalcular o bbox de um model space grande já indexado.
         self._layout_index_cache: dict[str, tuple[GridIndex, dict[str, object]]] = {}
@@ -312,6 +313,37 @@ class Document:
         if actual.casefold() == "model":
             return self.drawing.modelspace()
         return self.drawing.layouts.get(actual)
+
+    def layout_index(self, name: str | None = None) -> GridIndex:
+        """Retorna o índice espacial de um layout, construindo-o sob demanda."""
+        actual = self.resolve_layout_name(name or self._current_layout)
+        if actual.casefold() == self._current_layout.casefold():
+            return self.index
+
+        cached = self._layout_index_cache.get(actual)
+        if cached is not None:
+            try:
+                if len(self.layout_space(actual)) == len(cached[1]):
+                    return cached[0]
+            except TypeError:
+                pass
+
+        index = GridIndex()
+        by_handle: dict[str, object] = {}
+        items = []
+        for entity in self.layout_space(actual):
+            handle = entity.dxf.get("handle")
+            if handle is None:
+                continue
+            by_handle[handle] = entity
+            items.append((handle, entity_bbox(entity)))
+        index.build(items)
+        self._layout_index_cache[actual] = (index, by_handle)
+        return index
+
+    def layout_revision(self, name: str | None = None) -> int:
+        actual = self.resolve_layout_name(name or self._current_layout)
+        return self._layout_revisions.get(actual, 0)
 
     def set_layout(self, name: str) -> bool:
         """Seleciona um layout e reconstrói o índice do espaço visível.
@@ -470,6 +502,9 @@ class Document:
         self.invalidate_layer_cache()
         self._dirty_all = True
         self._dirty_handles.clear()
+        self._layout_revisions[self._current_layout] = (
+            self._layout_revisions.get(self._current_layout, 0) + 1
+        )
         self.geometry_revision += 1
         self._layout_index_cache[self._current_layout] = (self.index, self._by_handle)
 
@@ -481,6 +516,9 @@ class Document:
         """
         invalidate_primitives(handle)
         self._dirty_handles.add(handle)
+        self._layout_revisions[self._current_layout] = (
+            self._layout_revisions.get(self._current_layout, 0) + 1
+        )
         self.geometry_revision += 1
 
     def invalidate_all_geometry(self) -> None:
@@ -488,6 +526,8 @@ class Document:
         self.invalidate_layer_cache()
         invalidate_primitives()
         self._dirty_all = True
+        for layout in self.layout_names():
+            self._layout_revisions[layout] = self._layout_revisions.get(layout, 0) + 1
         self.geometry_revision += 1
 
     def consume_geometry_changes(self) -> tuple[bool, set[str]]:
@@ -556,8 +596,15 @@ class Document:
                 changed.append(hatch)
         return changed
 
-    def entity_by_handle(self, handle: str):
-        return self._by_handle.get(handle)
+    def entity_by_handle(self, handle: str, layout: str | None = None):
+        if layout is None or layout.casefold() == self._current_layout.casefold():
+            return self._by_handle.get(handle)
+        actual = self.resolve_layout_name(layout)
+        cached = self._layout_index_cache.get(actual)
+        if cached is None:
+            self.layout_index(actual)
+            cached = self._layout_index_cache.get(actual)
+        return cached[1].get(handle) if cached is not None else None
 
     def query(self, box: BBox) -> list:
         """Entidades cujo bbox intersecta box (candidatas -- refine depois)."""
@@ -568,14 +615,14 @@ class Document:
 
     # ---------------- entidades ----------------
 
-    def entities(self) -> Iterator:
-        return iter(self.msp)
+    def entities(self, layout: str | None = None) -> Iterator:
+        return iter(self.layout_space(layout))
 
     def __len__(self) -> int:
         return len(self._by_handle)
 
-    def extents(self) -> BBox:
-        return self.index.extents()
+    def extents(self, layout: str | None = None) -> BBox:
+        return self.layout_index(layout).extents()
 
     def _attribs(self, layer: str | None, extra: dict | None = None) -> dict:
         d = {"layer": layer or self._current_layer}

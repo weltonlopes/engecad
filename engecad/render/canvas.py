@@ -54,6 +54,7 @@ from ..core.picking import probe_at
 from .displaylist import DisplayList
 from .framecache import FrameCache
 from .styles import DARK, aci_to_qcolor
+from .viewport import Viewport
 
 # Um entalhe comum da roda aproxima/afasta 35%. O valor anterior (18%) exigia
 # muitas voltas para navegar entre a vista geral e o detalhe de um DXF extenso.
@@ -170,10 +171,14 @@ class CadCanvas(_CanvasBase):
         self._panning = False
         self._pan_anchor: QPointF | None = None
 
-        self._display = DisplayList(ctx.doc)
+        self._display_cache: dict[str, DisplayList] = {}
+        self._display = self._display_for_layout(ctx.doc.current_layout)
         self._frame = FrameCache()
         self._gpu_geometry = GpuGeometry(ctx.doc) if _OPENGL_CANVAS else None
+        self._model_gpu_geometry = None
         self._gpu_renderer = None
+        self._model_gpu_renderer = None
+        self._model_gpu_error: str | None = None
         self._gpu_error: str | None = None
         self._gpu_build = QTimer(self)
         self._gpu_build.setSingleShot(True)
@@ -212,6 +217,7 @@ class CadCanvas(_CanvasBase):
         self._hover_shapes: list = []
         self._static_texts: dict[tuple[str, int, str], tuple[QStaticText, float]] = {}
         ctx.documentReplaced.connect(self._on_document_replaced)
+        ctx.layoutChanged.connect(self._on_layout_changed)
         # Qualquer mutacao do documento (geometria, cor ou visibilidade de
         # camada) invalida o quadro guardado; a display list so reconstroi os
         # tiles que a entidade alterada tocava.
@@ -237,12 +243,35 @@ class CadCanvas(_CanvasBase):
 
     # ---------------- invalidacao da cena ----------------
 
+    def _display_for_layout(self, layout: str) -> DisplayList:
+        actual = self.ctx.doc.resolve_layout_name(layout)
+        display = self._display_cache.get(actual)
+        if display is None:
+            display = self._display_cache[actual] = DisplayList(self.ctx.doc, layout=actual)
+        return display
+
+    def _on_layout_changed(self, _name: str) -> None:
+        self._display = self._display_for_layout(self.ctx.doc.current_layout)
+        if not self.ctx.doc.is_model_layout:
+            self._ensure_model_gpu_geometry()
+        self._frame.invalidate()
+        self.update()
+
+    def _ensure_model_gpu_geometry(self) -> None:
+        if not _OPENGL_CANVAS or self._model_gpu_geometry is not None:
+            return
+        self._model_gpu_geometry = GpuGeometry(self.ctx.doc, layout="Model")
+        self._gpu_build.start()
+
     def _on_document_replaced(self) -> None:
-        self._display = DisplayList(self.ctx.doc)
+        self._display_cache = {}
+        self._display = self._display_for_layout(self.ctx.doc.current_layout)
         self._snap_warm.stop()
         self._snap_warm_revision = -1
         if self._gpu_geometry is not None:
             self._gpu_geometry.start(self.ctx.doc)
+            if self._model_gpu_geometry is not None:
+                self._model_gpu_geometry.start(self.ctx.doc)
             self._gpu_build.start()
         else:
             self._start_snap_warm()
@@ -254,7 +283,11 @@ class CadCanvas(_CanvasBase):
     def invalidate_scene(self) -> None:
         """Descarta o quadro guardado. A geometria em si so e refeita se mudou."""
         self._frame.invalidate()
-        if self._gpu_geometry is not None and self._gpu_geometry.ensure_current():
+        gpu_changed = False
+        for geometry in (self._gpu_geometry, self._model_gpu_geometry):
+            if geometry is not None and geometry.ensure_current():
+                gpu_changed = True
+        if gpu_changed:
             self._gpu_build.start()
         self._update_scene_and_overlay()
 
@@ -270,10 +303,14 @@ class CadCanvas(_CanvasBase):
 
     def _advance_gpu(self) -> None:
         """Prepara VBOs sem monopolizar a thread da interface."""
-        geometry = self._gpu_geometry
-        if geometry is None:
+        geometries = [g for g in (self._gpu_geometry, self._model_gpu_geometry) if g is not None]
+        if not geometries:
             return
-        if not geometry.advance(BUILD_SLICE_MS):
+        complete = True
+        for geometry in geometries:
+            if not geometry.advance(BUILD_SLICE_MS):
+                complete = False
+        if not complete:
             self._gpu_build.start()
         else:
             self._start_snap_warm()
@@ -559,6 +596,16 @@ class CadCanvas(_CanvasBase):
             self._gpu_renderer = None
             self.ctx.message(f"OpenGL indisponivel; usando QPainter: {exc}")
 
+    def _ensure_model_gpu_renderer(self):
+        if self._model_gpu_renderer is not None or self._model_gpu_error is not None:
+            return self._model_gpu_renderer
+        try:
+            self._model_gpu_renderer = OpenGLRenderer(self.context())
+        except (RuntimeError, AttributeError) as exc:
+            self._model_gpu_error = str(exc)
+            self.ctx.message(f"Viewport OpenGL indisponivel; sem geometria do Model Space: {exc}")
+        return self._model_gpu_renderer
+
     def paintGL(self) -> None:
         """Compoe base Qt, vetores GPU e overlays Qt no mesmo framebuffer."""
         renderer = self._gpu_renderer
@@ -595,6 +642,70 @@ class CadCanvas(_CanvasBase):
         self._paint_rasters(painter, self.vp)
         if self.show_grid:
             self._paint_grid(painter, self.vp)
+
+        # Em Paper Space, o Model Space é desenhado primeiro dentro de cada
+        # viewport. O renderer recebe uma viewport local e usa scissor para
+        # limitar os VBOs ao retângulo correspondente.
+        if not self.doc.is_model_layout and self._model_gpu_geometry is not None:
+            model_renderer = self._ensure_model_gpu_renderer()
+            if model_renderer is not None:
+                model_geometry = self._model_gpu_geometry
+                model_renderer.request(model_geometry.snapshot)
+                if not model_renderer.upload_step():
+                    self.update()
+                model_snapshot = model_renderer.active_snapshot
+                if model_snapshot is not model_geometry.snapshot:
+                    model_snapshot = None
+                if model_snapshot is not None:
+                    for viewport_entity in self._paper_viewports():
+                        model_vp, rect = self._model_viewport(self.vp, viewport_entity)
+                        viewport_handle = str(viewport_entity.dxf.handle)
+                        painter.save()
+                        painter.setClipRect(rect, Qt.IntersectClip)
+                        model_geometry.paint_fills(
+                            painter,
+                            model_snapshot,
+                            model_vp,
+                            self.theme is DARK,
+                            viewport_handle,
+                        )
+                        painter.restore()
+
+                    painter.beginNativePainting()
+                    for viewport_entity in self._paper_viewports():
+                        model_vp, _rect = self._model_viewport(self.vp, viewport_entity)
+                        viewport_handle = str(viewport_entity.dxf.handle)
+                        model_renderer.draw(
+                            model_vp,
+                            self.doc,
+                            self.theme is DARK,
+                            dpr,
+                            viewport_handle,
+                        )
+                    painter.endNativePainting()
+
+                    for viewport_entity in self._paper_viewports():
+                        model_vp, rect = self._model_viewport(self.vp, viewport_entity)
+                        viewport_handle = str(viewport_entity.dxf.handle)
+                        painter.save()
+                        painter.setClipRect(rect, Qt.IntersectClip)
+                        model_geometry.paint_placeholders(
+                            painter,
+                            model_snapshot,
+                            model_vp,
+                            self.theme is DARK,
+                            viewport_handle,
+                        )
+                        markers = model_geometry.visible_markers(
+                            model_snapshot,
+                            model_vp,
+                            viewport_handle,
+                        )
+                        if markers:
+                            self._paint_markers(painter, model_vp, markers)
+                        painter.restore()
+
+        # Objetos da folha ficam acima do conteúdo das viewports.
         geometry.paint_fills(painter, snapshot, self.vp, self.theme is DARK)
         painter.beginNativePainting()
         renderer.draw(
@@ -611,11 +722,10 @@ class CadCanvas(_CanvasBase):
         painter.end()
 
     def _destroy_gl(self) -> None:
-        renderer = self._gpu_renderer
-        if renderer is None:
-            return
         self.makeCurrent()
-        renderer.destroy()
+        for renderer in (self._gpu_renderer, self._model_gpu_renderer):
+            if renderer is not None:
+                renderer.destroy()
         self.doneCurrent()
 
     def _paint_cpu_on_current_surface(self) -> None:
@@ -670,6 +780,65 @@ class CadCanvas(_CanvasBase):
         """Completa a cena sem depender do laco de eventos (testes, exportacao)."""
         self._frame.render_now(self.vp, self.devicePixelRatioF(), self._scene_steps)
 
+    def _paper_viewports(self):
+        """Viewports flutuantes do Paper Space (a viewport principal fica fora)."""
+        if self.doc.is_model_layout:
+            return []
+        layout = self.doc.layout_space()
+        return [
+            viewport
+            for viewport in layout.query("VIEWPORT")
+            if int(viewport.dxf.get("status", 2) or 0) > 1
+        ]
+
+    @staticmethod
+    def _model_viewport(paper_vp, viewport_entity):
+        """Transforma um VIEWPORT DXF em uma viewport de tela composta.
+
+        A versão inicial cobre o caso ortogonal, que é o formato predominante
+        em pranchas cadastrais. O centro e a altura vêm do sistema de coordenadas
+        do Model Space; a largura/altura do retângulo vêm do Paper Space.
+        """
+        dxf = viewport_entity.dxf
+        width = max(float(dxf.get("width", 0.0) or 0.0), 1e-9)
+        height = max(float(dxf.get("height", 0.0) or 0.0), 1e-9)
+        view_height = max(float(dxf.get("view_height", 0.0) or 0.0), 1e-9)
+        center = Vec2.of(dxf.get("center"))
+        view_center = Vec2.of(dxf.get("view_center_point", (0.0, 0.0)))
+
+        screen_x, screen_y = paper_vp.world_to_screen(center)
+        screen_width = width * paper_vp.scale
+        screen_height = height * paper_vp.scale
+        model_vp = Viewport(
+            max(1, int(round(screen_width))),
+            max(1, int(round(screen_height))),
+        )
+        model_vp.center = view_center
+        model_vp.set_scale(paper_vp.scale * height / view_height)
+        model_vp.screen_offset_x = screen_x - screen_width * 0.5
+        model_vp.screen_offset_y = screen_y - screen_height * 0.5
+        model_vp.surface_width = paper_vp.width
+        model_vp.surface_height = paper_vp.height
+        rect = QRectF(
+            model_vp.screen_offset_x,
+            model_vp.screen_offset_y,
+            screen_width,
+            screen_height,
+        ).normalized()
+        return model_vp, rect
+
+    @staticmethod
+    def _clip_scene_step(step, rect):
+        def clipped(painter, deadline):
+            painter.save()
+            painter.setClipRect(rect, Qt.IntersectClip)
+            try:
+                return step(painter, deadline)
+            finally:
+                painter.restore()
+
+        return clipped
+
     def _scene_steps(self, vp):
         """Etapas do quadro, na ordem em que valem mais para quem olha.
 
@@ -678,9 +847,50 @@ class CadCanvas(_CanvasBase):
         etapa com orcamento.
         """
         yield lambda p, deadline: self._paint_base(p, vp)
+
+        # Primeiro entram os objetos do Model Space, recortados em cada janela
+        # de apresentação. O Paper Space é desenhado depois para que molduras,
+        # carimbos e anotações fiquem por cima do conteúdo das viewports.
+        for viewport_entity in self._paper_viewports():
+            model_vp, rect = self._model_viewport(vp, viewport_entity)
+            viewport_handle = str(viewport_entity.dxf.handle)
+            model_display = self._display_for_layout("Model")
+            yield lambda p, deadline, display=model_display: display.prepare(deadline)
+            planned_model = []
+
+            def plan_model(
+                _painter,
+                _deadline,
+                display=model_display,
+                view=model_vp,
+                planned=planned_model,
+                handle=viewport_handle,
+            ):
+                planned.append(
+                    display.plan(
+                        vp=view,
+                        dark=self.theme is DARK,
+                        dpr=self.devicePixelRatioF(),
+                        viewport_handle=handle,
+                    )
+                )
+                return True
+
+            yield plan_model
+            model_geometry, model_markers = planned_model[0]
+            for step in model_geometry:
+                yield self._clip_scene_step(step, rect)
+            if model_markers:
+                yield self._clip_scene_step(
+                    lambda p, deadline, view=model_vp, markers=model_markers: self._paint_markers(
+                        p, view, markers
+                    ),
+                    rect,
+                )
+
         yield lambda p, deadline: self._display.prepare(deadline)
-        # Decidir o que desenhar tambem custa (culling e escolha de nivel sobre
-        # centenas de milhares de linhas), entao tem fatia propria.
+        # Decidir o que desenhar também custa (culling e escolha de nível sobre
+        # centenas de milhares de linhas), então tem fatia própria.
         planned = []
         yield lambda p, deadline: bool(
             planned.append(self._display.plan(vp, self.theme is DARK, self.devicePixelRatioF()))

@@ -125,7 +125,7 @@ class _InkPass:
         img.setDevicePixelRatio(self.dpr)
         painter.save()
         painter.resetTransform()
-        painter.drawImage(0, 0, img)
+        painter.drawImage(self.vp.screen_offset_x, self.vp.screen_offset_y, img)
         painter.restore()
         return True
 
@@ -223,11 +223,18 @@ class _CellPass:
 
 
 class DisplayList:
-    """Cache de desenho de um documento. Um por canvas."""
+    """Cache de desenho de um espaço de entidades.
 
-    def __init__(self, doc):
+    ``layout=None`` acompanha o layout corrente; quando informado, a lista
+    permanece ligada àquele layout e pode ser usada para desenhar o Model
+    Space dentro de viewports do Paper Space.
+    """
+
+    def __init__(self, doc, layout: str | None = None):
         self.doc = doc
+        self.layout = layout
         self._revision = -1
+        self._layout_key: str | None = None
         self._origin = (0.0, 0.0)
 
         # Arrays paralelos, indexados por "slot". Um slot vago tem bbox vazia,
@@ -262,6 +269,15 @@ class DisplayList:
 
     # ---------------- sincronizacao com o documento ----------------
 
+    def _space(self):
+        return self.doc.layout_space(self.layout) if self.layout is not None else self.doc.msp
+
+    def _index(self):
+        return self.doc.layout_index(self.layout) if self.layout is not None else self.doc.index
+
+    def _entity_by_handle(self, handle):
+        return self.doc.entity_by_handle(handle, self.layout)
+
     def prepare(self, deadline: float | None = None) -> bool:
         """Absorve as mudancas do documento. True quando esta pronta para desenhar.
 
@@ -269,15 +285,27 @@ class DisplayList:
         etapa so. O trabalho e fatiado como o resto do quadro, e quem chama
         insiste ate receber True.
         """
-        if self.doc.geometry_revision != self._revision:
-            self._revision = self.doc.geometry_revision
-            full, dirty = self.doc.consume_geometry_changes()
-            if full or self._rebuilding is not None:
-                # Mudanca durante uma reconstrucao: recomecar e mais simples do
-                # que costurar o novo estado no meio do antigo, e e raro.
+        layout = self.doc.resolve_layout_name(self.layout or self.doc.current_layout)
+        target_revision = self.doc.layout_revision(layout)
+        if self._layout_key != layout:
+            self._layout_key = layout
+            self._revision = -1
+        if target_revision != self._revision:
+            self._revision = target_revision
+            if self.layout is not None:
+                # Listas fixas (como a do Model Space usado dentro de uma
+                # viewport) não podem consumir o delta global do documento:
+                # outra lista também precisa recebê-lo.
+                self._dirty_queue.clear()
                 self._start_rebuild()
             else:
-                self._dirty_queue.extend(dirty)
+                full, dirty = self.doc.consume_geometry_changes()
+                if full or self._rebuilding is not None:
+                    # Mudanca durante uma reconstrucao: recomecar e mais
+                    # simples do que costurar o novo estado no meio do antigo.
+                    self._start_rebuild()
+                else:
+                    self._dirty_queue.extend(dirty)
 
         if self._rebuilding is not None:
             return self._advance_rebuild(deadline)
@@ -291,9 +319,8 @@ class DisplayList:
             pass
 
     def _start_rebuild(self) -> None:
-        """Prepara a varredura do modelspace. As entidades vem por lotes."""
-        doc = self.doc
-        cap = max(len(doc) * 2, 64)
+        """Prepara a varredura do layout. As entidades vêm por lotes."""
+        cap = max(len(self._space()) * 2, 64)
         self._slot = {}
         self._ents = [None] * cap
         self._free = []
@@ -307,11 +334,11 @@ class DisplayList:
         self._layer_names = []
         self._dirty_queue.clear()
         self.clear()
-        self._rebuilding = (iter(doc.msp), {})
+        self._rebuilding = (iter(self._space()), {})
 
     def _advance_rebuild(self, deadline: float | None) -> bool:
         source, colors = self._rebuilding
-        boxes = self.doc.index._boxes
+        boxes = self._index()._boxes
         done = False
         while True:
             batch = list(itertools.islice(source, _CHUNK))
@@ -429,7 +456,7 @@ class DisplayList:
         i = self._slot.get(handle)
         if i is not None:
             self._drop_cells_at(self._bbox[i])
-        entity = self.doc.entity_by_handle(handle)
+        entity = self._entity_by_handle(handle)
         if entity is None or not entity.is_alive:
             if i is not None:
                 self._slot.pop(handle, None)
@@ -443,7 +470,7 @@ class DisplayList:
             i = self._alloc()
             self._slot[handle] = i
         self._ents[i] = entity
-        self._fill_slot(i, entity, self.doc.index._boxes.get(handle), {})
+        self._fill_slot(i, entity, self._index()._boxes.get(handle), {})
         self._drop_cells_at(self._bbox[i])
         self._buckets = None
 
@@ -534,7 +561,13 @@ class DisplayList:
 
     # ---------------- desenho ----------------
 
-    def plan(self, vp, dark: bool = True, dpr: float = 1.0) -> tuple[list, list]:
+    def plan(
+        self,
+        vp,
+        dark: bool = True,
+        dpr: float = 1.0,
+        viewport_handle: str | None = None,
+    ) -> tuple[list, list]:
         """Monta a lista de etapas de desenho e as entidades a rotular.
 
         Cada etapa e `f(painter, deadline)` e devolve True quando terminou. Um
@@ -558,7 +591,7 @@ class DisplayList:
                 & (bb[:, 3] >= vis.miny)
                 & (bb[:, 1] <= vis.maxy)
             )
-        visible = self._visible_layers()
+        visible = self._visible_layers(viewport_handle)
         m &= visible[self._layer[:n]]
         idx = np.flatnonzero(m)
         if idx.size == 0:
@@ -594,19 +627,27 @@ class DisplayList:
         entities = [self._ents[i] for i in markers.tolist() if self._ents[i] is not None]
         return steps, entities
 
-    def paint(self, painter, vp, dark: bool = True, dpr: float = 1.0) -> list:
+    def paint(
+        self,
+        painter,
+        vp,
+        dark: bool = True,
+        dpr: float = 1.0,
+        viewport_handle: str | None = None,
+    ) -> list:
         """Desenha a cena inteira de uma vez. Atalho para quem nao fatia."""
-        steps, entities = self.plan(vp, dark, dpr)
+        steps, entities = self.plan(vp, dark, dpr, viewport_handle)
         for step in steps:
             while not step(painter, math.inf):
                 pass
         return entities
 
-    def _visible_layers(self) -> np.ndarray:
+    def _visible_layers(self, viewport_handle: str | None = None) -> np.ndarray:
         doc = self.doc
         out = np.ones(max(len(self._layer_names), 1), dtype=bool)
         for i, name in enumerate(self._layer_names):
-            out[i] = doc.layer_is_visible(name)
+            props = doc.layer_manager.properties(name, viewport_handle)
+            out[i] = props.on and not props.frozen
         return out
 
     def _rgb_table(self, dark: bool) -> np.ndarray:
@@ -703,8 +744,8 @@ class DisplayList:
             0.0,
             0.0,
             -s,
-            (ox - vp.center.x) * s + vp.width * 0.5,
-            vp.height * 0.5 + (vp.center.y - oy) * s,
+            (ox - vp.center.x) * s + vp.width * 0.5 + vp.screen_offset_x,
+            vp.height * 0.5 + (vp.center.y - oy) * s + vp.screen_offset_y,
         )
 
     def _draw_cell_step(self, painter, vp, level, key, visible, dark, deadline) -> bool:

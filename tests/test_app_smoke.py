@@ -203,6 +203,34 @@ def test_canvas_paints_background_and_grid(win):
     assert len(with_grid) > len(without_grid), "a grade nao foi desenhada"
 
 
+def test_paper_layout_viewport_paints_model_space(win):
+    """Uma viewport de Paper Space deve mostrar a geometria do Model Space."""
+    win.canvas.show_grid = False
+    win.ctx.doc.add_line((E - 50, N), (E + 50, N))
+    win.ctx.doc.undo.clear()
+    paper = win.ctx.doc.drawing.layouts.get("Layout1")
+    paper.add_viewport(
+        center=(200, 150),
+        size=(300, 200),
+        view_center_point=(E, N),
+        view_height=100,
+    )
+
+    assert win.ctx.set_layout("Layout1")
+    win.ctx.viewport.center = Vec2(200, 150)
+    win.ctx.viewport.set_scale(1.0)
+    win.canvas.render_scene_now()
+    image = _render(win)
+
+    background = win.canvas.theme.q("background").rgba()
+    changed = sum(
+        image.pixel(x, y) != background
+        for y in range(140, 161)
+        for x in range(100, 301)
+    )
+    assert changed > 100, "a viewport nao compositou a linha do Model Space"
+
+
 def test_console_executes_and_collapses_into_one_undo(win):
     console = win.console
     console.execute("for i in range(5):\n    add_line((0, 0), (i, 10))\n")

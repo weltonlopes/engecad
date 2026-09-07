@@ -48,6 +48,7 @@ GL_SRC_ALPHA = 0x0302
 GL_ONE_MINUS_SRC_ALPHA = 0x0303
 GL_COLOR_BUFFER_BIT = 0x00004000
 GL_MULTISAMPLE = 0x809D
+GL_SCISSOR_TEST = 0x0C11
 
 # 16 e potencia de dois: a parcela alta e representavel exatamente em float32
 # para toda coordenada terrestre usual, enquanto a baixa ganha resolucao
@@ -180,10 +181,12 @@ def split_scalar(value: float) -> tuple[float, float]:
 class GpuGeometry:
     """Constroi snapshots de geometria em fatias curtas do event loop."""
 
-    def __init__(self, doc):
+    def __init__(self, doc, layout: str | None = None):
         self.doc = doc
+        self.layout = layout
         self.snapshot: GpuSnapshot | None = None
         self._revision = -1
+        self._layout_key: str | None = None
         self._source = None
         self._groups: dict[tuple, _Group] = {}
         self._group_source = None
@@ -213,8 +216,9 @@ class GpuGeometry:
             self.doc = doc
         if replaced:
             self.snapshot = None
-        self._revision = self.doc.geometry_revision
-        self._source = iter(self.doc.entities())
+        self._layout_key = self.doc.resolve_layout_name(self.layout or self.doc.current_layout)
+        self._revision = self.doc.layout_revision(self._layout_key)
+        self._source = iter(self.doc.entities(self.layout))
         self._groups = {}
         self._group_source = None
         self._packed = []
@@ -226,18 +230,20 @@ class GpuGeometry:
         self._started = time.perf_counter()
         self._layer_props = {}
 
-        ext = self.doc.extents()
+        ext = self.doc.extents(self.layout)
         span = max(ext.width, ext.height, 1.0) if not ext.is_empty else 1.0
         # Aproximadamente 512 entidades por tile num desenho bidimensional. Em
         # corredores lineares o teto de 128 ainda impede VBOs gigantes.
-        axis = min(128.0, max(8.0, math.sqrt(max(len(self.doc), 1) / 512.0)))
+        count = len(self.doc.layout_space(self.layout))
+        axis = min(128.0, max(8.0, math.sqrt(max(count, 1) / 512.0)))
         self._tile = max(span / axis, 1e-6)
         # Erro de tessellacao abaixo de ~0,2 px na vista geral, limitado para
         # preservar detalhe em desenhos pequenos e conter curvas astronomicas.
         self._sagitta = min(0.10, max(0.001, span / 5_000_000.0))
 
     def ensure_current(self) -> bool:
-        if self.doc.geometry_revision == self._revision:
+        layout = self.doc.resolve_layout_name(self.layout or self.doc.current_layout)
+        if layout == self._layout_key and self.doc.layout_revision(layout) == self._revision:
             return False
         self.start(self.doc)
         return True
@@ -317,7 +323,7 @@ class GpuGeometry:
         if not entity.is_alive:
             return
         handle = entity.dxf.get("handle")
-        box = self.doc.index._boxes.get(handle)
+        box = self.doc.layout_index(self.layout)._boxes.get(handle)
         if box is None or box.is_empty:
             return
         self._entities += 1
@@ -424,22 +430,36 @@ class GpuGeometry:
         self._groups = {}
         self._group_source = None
 
-    def visible_markers(self, snapshot: GpuSnapshot, viewport) -> list:
+    def visible_markers(
+        self,
+        snapshot: GpuSnapshot,
+        viewport,
+        viewport_handle: str | None = None,
+    ) -> list:
         vis = viewport.visible_bbox()
         result = []
         for marker in snapshot.markers:
-            if self.doc.layer_is_visible(marker.layer) and marker.bbox.intersects(vis):
+            props = self.doc.layer_manager.properties(marker.layer, viewport_handle)
+            if props.on and not props.frozen and marker.bbox.intersects(vis):
                 result.append(marker.entity)
                 if len(result) > MAX_MARKERS:
                     return []
         return result
 
-    def paint_fills(self, painter, snapshot: GpuSnapshot, viewport, dark: bool) -> None:
+    def paint_fills(
+        self,
+        painter,
+        snapshot: GpuSnapshot,
+        viewport,
+        dark: bool,
+        viewport_handle: str | None = None,
+    ) -> None:
         vis = viewport.visible_bbox()
         painter.save()
         painter.setPen(Qt.NoPen)
         for fill in snapshot.fills:
-            if not self.doc.layer_is_visible(fill.layer) or not fill.bbox.intersects(vis):
+            props = self.doc.layer_manager.properties(fill.layer, viewport_handle)
+            if not props.on or props.frozen or not fill.bbox.intersects(vis):
                 continue
             color = QColor(aci_to_qcolor(fill.aci, dark))
             color.setAlpha(fill.alpha)
@@ -452,15 +472,24 @@ class GpuGeometry:
                     0.0,
                     0.0,
                     -scale,
-                    (ox - viewport.center.x) * scale + viewport.width * 0.5,
-                    viewport.height * 0.5 + (viewport.center.y - oy) * scale,
+                    (ox - viewport.center.x) * scale
+                    + viewport.width * 0.5
+                    + viewport.screen_offset_x,
+                    viewport.height * 0.5
+                    + (viewport.center.y - oy) * scale
+                    + viewport.screen_offset_y,
                 )
             )
             painter.drawPath(fill.path)
         painter.restore()
 
     def paint_placeholders(
-        self, painter, snapshot: GpuSnapshot, viewport, dark: bool
+        self,
+        painter,
+        snapshot: GpuSnapshot,
+        viewport,
+        dark: bool,
+        viewport_handle: str | None = None,
     ) -> None:
         """Desenha proxies desconhecidas como quadrados discretos de 5 px."""
         vis = viewport.visible_bbox()
@@ -472,7 +501,8 @@ class GpuGeometry:
         for marker in snapshot.placeholders:
             layer_on = visible.get(marker.layer)
             if layer_on is None:
-                layer_on = visible[marker.layer] = self.doc.layer_is_visible(marker.layer)
+                props = self.doc.layer_manager.properties(marker.layer, viewport_handle)
+                layer_on = visible[marker.layer] = props.on and not props.frozen
             if not layer_on or not marker.bbox.intersects(vis):
                 continue
             marker_style = (marker.aci, marker.alpha)
@@ -673,7 +703,14 @@ class OpenGLRenderer:
         buffer.write(first * 16, payload, len(payload))
         buffer.release()
 
-    def draw(self, viewport, doc, dark: bool, dpr: float = 1.0) -> None:
+    def draw(
+        self,
+        viewport,
+        doc,
+        dark: bool,
+        dpr: float = 1.0,
+        viewport_handle: str | None = None,
+    ) -> None:
         active = self._active
         if self.active_snapshot is None or active is None:
             return
@@ -685,12 +722,24 @@ class OpenGLRenderer:
         visible: dict[str, bool] = {}
 
         funcs = self.functions
-        funcs.glViewport(
-            0,
-            0,
-            max(1, int(round(viewport.width * dpr))),
-            max(1, int(round(viewport.height * dpr))),
+        surface_width = getattr(viewport, "surface_width", viewport.width)
+        surface_height = getattr(viewport, "surface_height", viewport.height)
+        offset_x = getattr(viewport, "screen_offset_x", 0.0)
+        offset_y = getattr(viewport, "screen_offset_y", 0.0)
+        width = max(1, int(round(viewport.width * dpr)))
+        height = max(1, int(round(viewport.height * dpr)))
+        x = int(round(offset_x * dpr))
+        y = int(round((surface_height - offset_y - viewport.height) * dpr))
+        nested = (
+            x != 0
+            or y != 0
+            or width != int(round(surface_width * dpr))
+            or height != int(round(surface_height * dpr))
         )
+        funcs.glViewport(x, y, width, height)
+        if nested:
+            funcs.glEnable(GL_SCISSOR_TEST)
+            funcs.glScissor(x, y, width, height)
         funcs.glDisable(GL_DEPTH_TEST)
         funcs.glDisable(GL_CULL_FACE)
         funcs.glEnable(GL_BLEND)
@@ -709,7 +758,8 @@ class OpenGLRenderer:
         for item in active.items:
             layer_on = visible.get(item.layer)
             if layer_on is None:
-                layer_on = visible[item.layer] = doc.layer_is_visible(item.layer)
+                props = doc.layer_manager.properties(item.layer, viewport_handle)
+                layer_on = visible[item.layer] = props.on and not props.frozen
             if not layer_on or not item.bbox.intersects(vis):
                 continue
             use_coarse = item.max_size * viewport.scale < 4.0 and item.coarse_count > 0
@@ -721,6 +771,8 @@ class OpenGLRenderer:
         program.disableAttributeArray(0)
         program.release()
         funcs.glDisable(GL_BLEND)
+        if nested:
+            funcs.glDisable(GL_SCISSOR_TEST)
 
     def _draw_ranges(
         self,
