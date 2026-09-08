@@ -46,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setOrganizationName("EngeCAD")
     _apply_dark_palette(app)
 
+    from .io.dwg_io import DwgError
+    from .io.dwg_io import open_document as open_dwg_document
     from .io.dxf_io import DxfError, open_document
     from .ui.main_window import MainWindow
 
@@ -62,6 +64,12 @@ def main(argv: list[str] | None = None) -> int:
                     open_document(win.ctx, arg)
                 except DxfError as exc:
                     win.ctx.message(str(exc))
+            break
+        if lower.endswith(".dwg"):
+            try:
+                open_dwg_document(win.ctx, arg)
+            except DwgError as exc:
+                win.ctx.message(str(exc))
             break
 
     return app.exec()

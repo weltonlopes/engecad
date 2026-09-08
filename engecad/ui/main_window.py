@@ -191,6 +191,7 @@ class MainWindow(QMainWindow):
         m_file.addAction(self._act("&Abrir desenho CAD...", self.on_open, "Ctrl+O"))
         m_file.addAction(self._act("&Salvar", self.on_save, "Ctrl+S"))
         m_file.addAction(self._act("Salvar &como...", self.on_save_as, "Ctrl+Shift+S"))
+        m_file.addAction(self._act("Exportar &DWG...", self.on_export_dwg))
         m_file.addSeparator()
         m_file.addAction(self._act("&Importar imagem de fundo...", self.on_import_raster, "Ctrl+I"))
         m_file.addAction(
@@ -305,6 +306,7 @@ class MainWindow(QMainWindow):
         m_help = self.menuBar().addMenu("A&juda")
         m_help.addAction(self._act("Lista de &comandos", lambda: self.run("AJUDA"), "F1"))
         m_help.addAction(self._act("Diagnostico de &raster (ECW)...", self.on_diagnose))
+        m_help.addAction(self._act("Diagnostico de D&WG...", self.on_diagnose_dwg))
         m_help.addAction(self._act("&Sobre o EngeCAD", self.on_about))
 
     def _build_ribbon(self) -> None:
@@ -914,6 +916,20 @@ class MainWindow(QMainWindow):
         self._update_title()
         return True
 
+    def on_export_dwg(self) -> None:
+        default_name = self.ctx.doc.path.stem if self.ctx.doc.path else "desenho"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar DWG", default_name, DWG_FILTER
+        )
+        if not path:
+            return
+        try:
+            p = export_dwg_document(self.ctx, path)
+        except DwgError as exc:
+            QMessageBox.critical(self, "Erro ao exportar DWG", str(exc))
+            return
+        self.ctx.message(f"Exportado: {p.name}")
+
     # ---------------- raster ----------------
 
     def on_import_raster(self) -> None:
@@ -975,6 +991,9 @@ class MainWindow(QMainWindow):
 
     def on_diagnose(self) -> None:
         QMessageBox.information(self, "Diagnostico de raster", diagnose())
+
+    def on_diagnose_dwg(self) -> None:
+        QMessageBox.information(self, "Diagnostico de DWG", diagnose_dwg())
 
     # ---------------- shapefile ----------------
 

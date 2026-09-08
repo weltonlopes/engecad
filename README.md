@@ -166,6 +166,32 @@ Para saber o que a sua máquina suporta: **Ajuda › Diagnóstico de raster (ECW
 
 ---
 
+## Sobre o DWG
+
+DWG é formato proprietário da Autodesk — ler/escrever nativamente exigiria
+licenciar código da Autodesk. O caminho livre é o **ODA File Converter**,
+gratuito, distribuído pela Open Design Alliance: converte DWG↔DXF localmente,
+sem internet depois de instalado. O DXF continua sendo o formato nativo do
+EngeCAD; o DWG é só entrada/saída para interoperar com AutoCAD e afins.
+
+**Para habilitar:** baixe o [ODA File
+Converter](https://www.opendesign.com/guestfiles/oda_file_converter),
+instale (fica em `C:\Program Files\ODA File Converter <versão>`) e reabra o
+EngeCAD — ele encontra o executável automaticamente. Para apontar para uma
+instalação fora do padrão, use a variável de ambiente `ENGECAD_ODA_BIN`.
+
+- **Arquivo › Abrir DWG...** converte para DXF em memória e abre como um DXF
+  de terceiro (mantém o CRS do projeto corrente se não houver sidecar).
+- **Arquivo › Exportar DWG...** salva o desenho corrente como `.dwg`, sem
+  alterar o `.dxf` nativo nem o caminho salvo do documento.
+
+Para saber o que a sua máquina suporta: **Ajuda › Diagnóstico de DWG**.
+
+> Assim como o GDAL externo, o ODA File Converter é chamado por *subprocess*,
+> nunca importado.
+
+---
+
 ## Console Python
 
 `F9` abre o console. A API já está no escopo, sem import:
