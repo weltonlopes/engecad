@@ -45,6 +45,7 @@ def save_sidecar(ctx, dxf_path: str | Path) -> Path:
         "crs": ctx.doc.crs.srid,
         "crs_wkt": ctx.doc.crs.to_wkt(),
         "current_layer": ctx.doc.current_layer,
+        "current_layout": ctx.doc.current_layout,
         "annotation_scale": ctx.doc.annotation_scale,
         "project_attributes": dict(ctx.doc.project_attributes),
         "layers": ctx.doc.layer_manager.export_metadata(),
@@ -86,6 +87,13 @@ def load_sidecar(ctx, dxf_path: str | Path) -> dict | None:
     layer = data.get("current_layer")
     if layer and layer in ctx.doc.layer_names():
         ctx.doc.current_layer = layer
+
+    layout = data.get("current_layout")
+    if layout:
+        try:
+            ctx.set_layout(str(layout))
+        except ValueError:
+            ctx.message(f"Layout nao encontrado no DXF: {layout}")
 
     try:
         ctx.doc.annotation_scale = max(float(data.get("annotation_scale", 1000.0)), 1.0)

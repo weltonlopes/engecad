@@ -54,14 +54,16 @@ def main(argv: list[str] | None = None) -> int:
     win = MainWindow()
     win.show()
 
-    # engecad desenho.dxf (ou .dwg) abre direto
+    # engecad desenho.dxf|desenho.dwg abre direto
     for arg in argv[1:]:
-        lower = arg.lower()
-        if lower.endswith(".dxf"):
-            try:
-                open_document(win.ctx, arg)
-            except DxfError as exc:
-                win.ctx.message(str(exc))
+        if arg.lower().endswith((".dxf", ".dwg")):
+            if arg.lower().endswith(".dwg"):
+                win._open_dwg_async(arg)
+            else:
+                try:
+                    open_document(win.ctx, arg)
+                except DxfError as exc:
+                    win.ctx.message(str(exc))
             break
         if lower.endswith(".dwg"):
             try:

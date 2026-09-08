@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass, field
 from fnmatch import fnmatchcase
 from typing import Any
 
+from ezdxf.lldxf.const import DXFTableEntryError
+
 PROTECTED_LAYERS = {"0", "DEFPOINTS"}
 
 
@@ -91,7 +93,13 @@ class LayerManager:
         return None
 
     def properties(self, name: str, viewport: str | None = None) -> LayerProperties:
-        layer = self._entry(name)
+        try:
+            layer = self._entry(name)
+        except DXFTableEntryError:
+            # VIEWPORTS é um layer especial que alguns DXFs/versões do ezdxf
+            # atribuem às janelas do Paper Space sem criar uma entrada na
+            # tabela LAYER. Ele deve continuar renderizável com estilo padrão.
+            return LayerProperties(name=str(name))
         actual_name = str(layer.dxf.name)
         color = abs(int(layer.dxf.get("color", 7) or 7))
         linetype = str(layer.dxf.get("linetype", "Continuous") or "Continuous")

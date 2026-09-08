@@ -30,12 +30,21 @@ class Viewport:
         self.height = max(1, height)
         self.center = Vec2(0.0, 0.0)  # ponto do mundo no centro da tela
         self.scale = 1.0  # pixels por unidade de mundo
+        # Deslocamento da origem local para uma janela composta. O canvas
+        # principal usa (0, 0); viewports de Paper Space desenham em uma
+        # sub-região da mesma superfície.
+        self.screen_offset_x = 0.0
+        self.screen_offset_y = 0.0
+        self.surface_width = self.width
+        self.surface_height = self.height
 
     # ---------------- estado ----------------
 
     def resize(self, width: int, height: int) -> None:
         self.width = max(1, int(width))
         self.height = max(1, int(height))
+        self.surface_width = self.width
+        self.surface_height = self.height
 
     @property
     def units_per_pixel(self) -> float:
@@ -50,16 +59,16 @@ class Viewport:
         numero pequeno (coordenada de tela). E este passo que impede a
         magnitude UTM de chegar ao rasterizador do Qt.
         """
-        sx = (x - self.center.x) * self.scale + self.width * 0.5
-        sy = self.height * 0.5 - (y - self.center.y) * self.scale
+        sx = (x - self.center.x) * self.scale + self.width * 0.5 + self.screen_offset_x
+        sy = self.height * 0.5 - (y - self.center.y) * self.scale + self.screen_offset_y
         return sx, sy
 
     def world_to_screen(self, p: Vec2) -> tuple[float, float]:
         return self.world_to_screen_xy(p.x, p.y)
 
     def screen_to_world(self, sx: float, sy: float) -> Vec2:
-        wx = (sx - self.width * 0.5) / self.scale + self.center.x
-        wy = (self.height * 0.5 - sy) / self.scale + self.center.y
+        wx = (sx - self.screen_offset_x - self.width * 0.5) / self.scale + self.center.x
+        wy = (self.height * 0.5 + self.screen_offset_y - sy) / self.scale + self.center.y
         return Vec2(wx, wy)
 
     def px_to_world(self, px: float) -> float:
@@ -104,8 +113,8 @@ class Viewport:
             self.set_scale(scale)
 
     def visible_bbox(self) -> BBox:
-        a = self.screen_to_world(0, self.height)
-        b = self.screen_to_world(self.width, 0)
+        a = self.screen_to_world(self.screen_offset_x, self.screen_offset_y + self.height)
+        b = self.screen_to_world(self.screen_offset_x + self.width, self.screen_offset_y)
         return BBox(a.x, a.y, b.x, b.y)
 
     # ---------------- escala cartografica ----------------

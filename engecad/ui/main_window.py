@@ -14,16 +14,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QTabBar,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __version__
 from ..context import AppContext
-from ..io.dwg_io import DwgError
-from ..io.dwg_io import diagnose as diagnose_dwg
-from ..io.dwg_io import export_document as export_dwg_document
-from ..io.dwg_io import open_document as open_dwg_document
+from ..io.dwg_io import install_document, load_document
 from ..io.dxf_io import DxfError, new_document, open_document, save_document
 from ..io.raster_import import (
     RasterImportError,
@@ -47,8 +45,8 @@ RASTER_FILTER = (
     "Imagens georreferenciadas (*.ecw *.tif *.tiff *.jp2 *.img *.sid *.vrt *.png *.jpg);;"
     "ECW (*.ecw);;GeoTIFF/COG (*.tif *.tiff);;Todos (*)"
 )
-DXF_FILTER = "Desenho DXF (*.dxf);;Todos (*)"
-DWG_FILTER = "Desenho DWG (*.dwg);;Todos (*)"
+CAD_FILTER = "Desenhos CAD (*.dxf *.dwg);;DXF (*.dxf);;DWG (*.dwg);;Todos (*)"
+DXF_SAVE_FILTER = "Desenho DXF (*.dxf);;Todos (*)"
 SHAPEFILE_FILTER = "Shapefile (*.shp);;Todos (*)"
 
 
@@ -70,14 +68,39 @@ class _ConvertWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class _DwgWorker(QThread):
+    """Lê o DWG fora da thread Qt sem tocar em widgets ou no contexto."""
+
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self):
+        try:
+            self.loaded.emit(load_document(self.path))
+        except Exception as exc:  # o slot principal mostra a falha ao usuário
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ctx = AppContext()
+        self._dwg_worker: _DwgWorker | None = None
+        self._dwg_progress: QProgressDialog | None = None
         self.setWindowTitle("EngeCAD")
         self.resize(1400, 880)
 
         self.canvas = CadCanvas(self.ctx, self)
+        self.layout_tabs = QTabBar(self)
+        self.layout_tabs.setObjectName("layout_tabs")
+        self.layout_tabs.setDocumentMode(True)
+        self.layout_tabs.setExpanding(False)
+        self.layout_tabs.setMovable(False)
+        self.layout_tabs.setDrawBase(True)
         self.cmdline = CommandLine(self.ctx, self)
         self.ctx.command_line = self.cmdline
 
@@ -86,6 +109,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(self.canvas, 1)
+        lay.addWidget(self.layout_tabs)
         lay.addWidget(self.cmdline)
         self.setCentralWidget(central)
 
@@ -138,6 +162,8 @@ class MainWindow(QMainWindow):
         self.lbl_layer.setMinimumWidth(140)
         self.lbl_sel = QLabel("", self)
         self.lbl_sel.setMinimumWidth(120)
+        self.lbl_layout = QLabel("", self)
+        self.lbl_layout.setMinimumWidth(110)
         self.lbl_crs = QLabel("", self)
         for w in (
             self.lbl_coord,
@@ -145,6 +171,7 @@ class MainWindow(QMainWindow):
             self.lbl_sel,
             self.lbl_scale,
             self.lbl_layer,
+            self.lbl_layout,
             self.lbl_crs,
         ):
             sb.addPermanentWidget(w)
@@ -161,8 +188,7 @@ class MainWindow(QMainWindow):
     def _build_actions(self) -> None:
         m_file = self.menuBar().addMenu("&Arquivo")
         m_file.addAction(self._act("&Novo...", self.on_new, "Ctrl+N"))
-        m_file.addAction(self._act("&Abrir DXF...", self.on_open, "Ctrl+O"))
-        m_file.addAction(self._act("Abrir DW&G...", self.on_open_dwg))
+        m_file.addAction(self._act("&Abrir desenho CAD...", self.on_open, "Ctrl+O"))
         m_file.addAction(self._act("&Salvar", self.on_save, "Ctrl+S"))
         m_file.addAction(self._act("Salvar &como...", self.on_save_as, "Ctrl+Shift+S"))
         m_file.addAction(self._act("Exportar &DWG...", self.on_export_dwg))
@@ -552,7 +578,7 @@ class MainWindow(QMainWindow):
     def _ribbon_window_actions(self) -> dict[str, QAction]:
         specs = {
             "NEW": ("Novo", self.on_new, "Criar um novo desenho"),
-            "OPEN": ("Abrir", self.on_open, "Abrir desenho DXF"),
+            "OPEN": ("Abrir", self.on_open, "Abrir desenho CAD"),
             "SAVE": ("Salvar", self.on_save, "Salvar o desenho atual"),
             "SAVE_AS": ("Salvar como", self.on_save_as, "Salvar em outro arquivo"),
             "IMPORT_RASTER": ("Imagem", self.on_import_raster, "Importar imagem georreferenciada"),
@@ -671,6 +697,8 @@ class MainWindow(QMainWindow):
         self.ctx.viewChanged.connect(self._on_view)
         self.ctx.toolChanged.connect(self._sync_ribbon_tool)
         self.ctx.layerManagerRequested.connect(self._show_layer_manager)
+        self.ctx.layoutChanged.connect(self._on_layout_changed)
+        self.layout_tabs.currentChanged.connect(self._on_layout_tab_changed)
         self._on_view()
         self._on_document_replaced()
         self._on_selection()
@@ -704,6 +732,44 @@ class MainWindow(QMainWindow):
         vp = self.ctx.viewport
         self.lbl_scale.setText(f"1:{vp.scale_denominator():,.0f}".replace(",", "."))
 
+    def _reload_layout_tabs(self) -> None:
+        current = self.ctx.doc.current_layout
+        self.layout_tabs.blockSignals(True)
+        try:
+            while self.layout_tabs.count():
+                self.layout_tabs.removeTab(self.layout_tabs.count() - 1)
+            for name in self.ctx.doc.layout_names():
+                self.layout_tabs.addTab(name)
+            index = next(
+                (
+                    i
+                    for i in range(self.layout_tabs.count())
+                    if self.layout_tabs.tabText(i).casefold() == current.casefold()
+                ),
+                -1,
+            )
+            if index >= 0:
+                self.layout_tabs.setCurrentIndex(index)
+        finally:
+            self.layout_tabs.blockSignals(False)
+        self.lbl_layout.setText(f"Layout: {current}")
+
+    def _on_layout_tab_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        name = self.layout_tabs.tabText(index)
+        if name.casefold() == self.ctx.doc.current_layout.casefold():
+            return
+        try:
+            self.ctx.set_layout(name)
+        except ValueError as exc:
+            self.ctx.message(str(exc))
+
+    def _on_layout_changed(self, name: str) -> None:
+        self._reload_layout_tabs()
+        self.lbl_layout.setText(f"Layout: {name}")
+        self._update_title()
+
     def _on_message(self, text: str) -> None:
         if hasattr(self, "ribbon_command_actions"):
             self.ribbon_command_actions["GRADE"].setChecked(self.canvas.show_grid)
@@ -725,16 +791,21 @@ class MainWindow(QMainWindow):
         self._on_selection()
         self.console.rebind(self.ctx)
         self.layer_panel.reload()
+        self._reload_layout_tabs()
         self._update_title()
         doc = self.ctx.doc
         self.lbl_crs.setText(doc.crs.srid)
         self.lbl_layer.setText(f"Camada: {doc.current_layer}")
+        self.lbl_layout.setText(f"Layout: {doc.current_layout}")
 
     def _update_title(self) -> None:
         doc = self.ctx.doc
         mark = "*" if doc.modified else ""
-        self.setWindowTitle(f"EngeCAD {__version__}  -  {doc.title}{mark}")
+        self.setWindowTitle(
+            f"EngeCAD {__version__}  -  {doc.title}  [{doc.current_layout}]{mark}"
+        )
         self.lbl_layer.setText(f"Camada: {doc.current_layer}")
+        self.lbl_layout.setText(f"Layout: {doc.current_layout}")
         self.lbl_crs.setText(doc.crs.srid)
 
     # ---------------- arquivo ----------------
@@ -766,8 +837,11 @@ class MainWindow(QMainWindow):
     def on_open(self) -> None:
         if not self._confirm_discard():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Abrir DXF", "", DXF_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir desenho CAD", "", CAD_FILTER)
         if not path:
+            return
+        if Path(path).suffix.lower() == ".dwg":
+            self._open_dwg_async(path)
             return
         try:
             open_document(self.ctx, path)
@@ -776,18 +850,46 @@ class MainWindow(QMainWindow):
             return
         self.ctx.message(f"Aberto: {Path(path).name}")
 
-    def on_open_dwg(self) -> None:
-        if not self._confirm_discard():
+    def _open_dwg_async(self, path: str) -> None:
+        if self._dwg_worker is not None and self._dwg_worker.isRunning():
+            self.ctx.message("Já existe uma leitura DWG em andamento")
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Abrir DWG", "", DWG_FILTER)
-        if not path:
-            return
+
+        progress = QProgressDialog("Lendo DWG nativo...", "", 0, 0, self)
+        progress.setWindowTitle("Abrir DWG")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setCancelButton(None)
+        progress.show()
+        self._dwg_progress = progress
+
+        worker = _DwgWorker(path, self)
+        self._dwg_worker = worker
+        worker.loaded.connect(self._on_dwg_loaded)
+        worker.failed.connect(self._on_dwg_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_dwg_finished)
+        worker.start()
+
+    def _on_dwg_loaded(self, doc) -> None:
         try:
-            open_dwg_document(self.ctx, path)
-        except DwgError as exc:
-            QMessageBox.critical(self, "Erro ao abrir DWG", str(exc))
-            return
-        self.ctx.message(f"Aberto (convertido de DWG): {Path(path).name}")
+            install_document(self.ctx, doc)
+            self.ctx.message(f"Aberto: {doc.path.name} (leitura DWG nativa)")
+        except Exception as exc:
+            self._on_dwg_failed(str(exc))
+
+    def _on_dwg_failed(self, message: str) -> None:
+        if self._dwg_progress is not None:
+            self._dwg_progress.close()
+        QMessageBox.critical(self, "Erro ao abrir DWG", message)
+
+    def _on_dwg_finished(self) -> None:
+        if self._dwg_progress is not None:
+            self._dwg_progress.close()
+            self._dwg_progress.deleteLater()
+            self._dwg_progress = None
+        self._dwg_worker = None
 
     def on_save(self) -> bool:
         if self.ctx.doc.path is None:
@@ -802,7 +904,7 @@ class MainWindow(QMainWindow):
         return True
 
     def on_save_as(self) -> bool:
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar DXF", "", DXF_FILTER)
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar DXF", "", DXF_SAVE_FILTER)
         if not path:
             return False
         try:
@@ -976,7 +1078,8 @@ class MainWindow(QMainWindow):
             f"<h3>EngeCAD {__version__}</h3>"
             "<p>CAD livre para mapeamento e plantas cadastrais.</p>"
             "<p>Construido sobre PySide6, ezdxf, pyproj e rasterio.</p>"
-            "<p>Formato nativo: DXF. Coordenadas em float64 no CRS do projeto.</p>",
+            "<p>Formato de trabalho: DXF; leitura nativa DWG. "
+            "Coordenadas em float64 no CRS do projeto.</p>",
         )
 
     # ---------------- fechamento ----------------
@@ -987,4 +1090,7 @@ class MainWindow(QMainWindow):
             return
         for layer in self.ctx.rasters:
             layer.close()
+        if self._dwg_worker is not None and self._dwg_worker.isRunning():
+            self._dwg_worker.requestInterruption()
+            self._dwg_worker.wait(2_000)
         ev.accept()

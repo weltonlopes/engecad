@@ -179,6 +179,7 @@ class Document:
         drawing: Drawing,
         crs: ProjectCRS | None = None,
         path: str | Path | None = None,
+        layout: str | None = None,
     ):
         self.drawing = drawing
         self.crs = crs or ProjectCRS()
@@ -192,6 +193,11 @@ class Document:
         self._dirty_all = True
         self._layer_cache: dict[str, tuple[bool, bool, int]] = {}
         self._modified = False
+        self._current_layout = self.resolve_layout_name(layout or "Model")
+        self._layout_revisions: dict[str, int] = {}
+        #: Índices espaciais mantidos separados: trocar de aba não precisa
+        #: recalcular o bbox de um model space grande já indexado.
+        self._layout_index_cache: dict[str, tuple[GridIndex, dict[str, object]]] = {}
         stored_current = str(drawing.header.get("$CLAYER", "0") or "0")
         self._current_layer = (
             stored_current if stored_current in drawing.layers else "0"
@@ -233,7 +239,10 @@ class Document:
     def open(cls, path: str | Path, crs: ProjectCRS | None = None) -> Document:
         p = Path(path)
         drawing = ezdxf.readfile(str(p))
-        return cls(drawing, crs, path=p)
+        # O sidecar do EngeCAD escolhe explicitamente o layout da ultima
+        # sessao. Sem sidecar mantemos o comportamento historico: abrir o
+        # model space, que tambem e o espaco esperado por DXFs de terceiros.
+        return cls(drawing, crs, path=p, layout="Model")
 
     def setup_default_layers(self) -> None:
         for name, color in DEFAULT_LAYERS:
@@ -269,7 +278,118 @@ class Document:
 
     @property
     def msp(self):
-        return self.drawing.modelspace()
+        """Espaco de entidades do layout atualmente selecionado.
+
+        O nome foi mantido por compatibilidade com o restante do aplicativo:
+        comandos, selecao, indice e renderizador passam a operar no layout
+        visivel sem precisar de caminhos paralelos para model/paper space.
+        """
+        return self.layout_space(self._current_layout)
+
+    @property
+    def current_layout(self) -> str:
+        return self._current_layout
+
+    @property
+    def is_model_layout(self) -> bool:
+        return self._current_layout.casefold() == "model"
+
+    def resolve_layout_name(self, name: str) -> str:
+        wanted = str(name or "Model").strip()
+        for actual in self.layout_names():
+            if actual.casefold() == wanted.casefold():
+                return actual
+        raise ValueError(f"layout inexistente: {name}")
+
+    def layout_names(self) -> list[str]:
+        """Nomes dos layouts na ordem das abas do DXF (Model primeiro)."""
+        names = list(self.drawing.layouts.names_in_taborder())
+        if not any(name.casefold() == "model" for name in names):
+            names.insert(0, "Model")
+        return names
+
+    def layout_space(self, name: str | None = None):
+        actual = self.resolve_layout_name(name or self._current_layout)
+        if actual.casefold() == "model":
+            return self.drawing.modelspace()
+        return self.drawing.layouts.get(actual)
+
+    def layout_index(self, name: str | None = None) -> GridIndex:
+        """Retorna o índice espacial de um layout, construindo-o sob demanda."""
+        actual = self.resolve_layout_name(name or self._current_layout)
+        if actual.casefold() == self._current_layout.casefold():
+            return self.index
+
+        cached = self._layout_index_cache.get(actual)
+        if cached is not None:
+            try:
+                if len(self.layout_space(actual)) == len(cached[1]):
+                    return cached[0]
+            except TypeError:
+                pass
+
+        index = GridIndex()
+        by_handle: dict[str, object] = {}
+        items = []
+        for entity in self.layout_space(actual):
+            handle = entity.dxf.get("handle")
+            if handle is None:
+                continue
+            by_handle[handle] = entity
+            items.append((handle, entity_bbox(entity)))
+        index.build(items)
+        self._layout_index_cache[actual] = (index, by_handle)
+        return index
+
+    def layout_revision(self, name: str | None = None) -> int:
+        actual = self.resolve_layout_name(name or self._current_layout)
+        return self._layout_revisions.get(actual, 0)
+
+    def set_layout(self, name: str) -> bool:
+        """Seleciona um layout e reconstrói o índice do espaço visível.
+
+        A troca não é uma alteração de conteúdo e, portanto, não marca o
+        desenho como modificado. O histórico de undo é limpo porque os
+        comandos guardam entidades do espaço anterior.
+        """
+        actual = self.resolve_layout_name(name)
+        if actual.casefold() == self._current_layout.casefold():
+            return False
+        self._layout_index_cache[self._current_layout] = (self.index, self._by_handle)
+        self._current_layout = actual
+        if actual.casefold() != "model":
+            # O DXF só aceita um layout de apresentação como aba ativa. Isso
+            # mantém a seleção atual coerente quando o arquivo for salvo por
+            # outra aplicação CAD.
+            self.drawing.layouts.set_active_layout(actual)
+
+        cached = self._layout_index_cache.get(actual)
+        if cached is not None:
+            # Scripts que usam ezdxf diretamente podem inserir/remover
+            # entidades sem passar pelos métodos do Document. A contagem é
+            # uma verificação O(1) no BlockLayout e evita reutilizar um cache
+            # obviamente desatualizado sem voltar a varrer um arquivo grande.
+            try:
+                if len(self.layout_space(actual)) != len(cached[1]):
+                    cached = None
+                    self._layout_index_cache.pop(actual, None)
+            except TypeError:
+                cached = None
+        if cached is None:
+            # Layouts criados depois da abertura do documento ainda não têm
+            # cache; somente a primeira visita paga a indexação completa.
+            self.index = GridIndex()
+            self._by_handle = {}
+            self._layer_cache = {}
+            self.rebuild_index()
+        else:
+            self.index, self._by_handle = cached
+            self._layer_cache = {}
+            self._dirty_all = True
+            self._dirty_handles.clear()
+            self.geometry_revision += 1
+        self.undo.clear()
+        return True
 
     @property
     def modified(self) -> bool:
@@ -382,7 +502,11 @@ class Document:
         self.invalidate_layer_cache()
         self._dirty_all = True
         self._dirty_handles.clear()
+        self._layout_revisions[self._current_layout] = (
+            self._layout_revisions.get(self._current_layout, 0) + 1
+        )
         self.geometry_revision += 1
+        self._layout_index_cache[self._current_layout] = (self.index, self._by_handle)
 
     def _mark_dirty(self, handle: str) -> None:
         """Sinaliza que a geometria da entidade mudou.
@@ -392,6 +516,9 @@ class Document:
         """
         invalidate_primitives(handle)
         self._dirty_handles.add(handle)
+        self._layout_revisions[self._current_layout] = (
+            self._layout_revisions.get(self._current_layout, 0) + 1
+        )
         self.geometry_revision += 1
 
     def invalidate_all_geometry(self) -> None:
@@ -399,6 +526,8 @@ class Document:
         self.invalidate_layer_cache()
         invalidate_primitives()
         self._dirty_all = True
+        for layout in self.layout_names():
+            self._layout_revisions[layout] = self._layout_revisions.get(layout, 0) + 1
         self.geometry_revision += 1
 
     def consume_geometry_changes(self) -> tuple[bool, set[str]]:
@@ -467,8 +596,15 @@ class Document:
                 changed.append(hatch)
         return changed
 
-    def entity_by_handle(self, handle: str):
-        return self._by_handle.get(handle)
+    def entity_by_handle(self, handle: str, layout: str | None = None):
+        if layout is None or layout.casefold() == self._current_layout.casefold():
+            return self._by_handle.get(handle)
+        actual = self.resolve_layout_name(layout)
+        cached = self._layout_index_cache.get(actual)
+        if cached is None:
+            self.layout_index(actual)
+            cached = self._layout_index_cache.get(actual)
+        return cached[1].get(handle) if cached is not None else None
 
     def query(self, box: BBox) -> list:
         """Entidades cujo bbox intersecta box (candidatas -- refine depois)."""
@@ -479,14 +615,14 @@ class Document:
 
     # ---------------- entidades ----------------
 
-    def entities(self) -> Iterator:
-        return iter(self.msp)
+    def entities(self, layout: str | None = None) -> Iterator:
+        return iter(self.layout_space(layout))
 
     def __len__(self) -> int:
         return len(self._by_handle)
 
-    def extents(self) -> BBox:
-        return self.index.extents()
+    def extents(self, layout: str | None = None) -> BBox:
+        return self.layout_index(layout).extents()
 
     def _attribs(self, layer: str | None, extra: dict | None = None) -> dict:
         d = {"layer": layer or self._current_layer}

@@ -12,6 +12,7 @@ import heapq
 from dataclasses import dataclass
 
 from .entities import (
+    MAX_INTERACTIVE_PROXY_BYTES,
     POINT_LIKE,
     closest_on_segments,
     entity_bbox,
@@ -24,6 +25,7 @@ from .geometry import BBox, Vec2, line_intersection
 MAX_PROBE_CANDIDATES = 512
 MAX_PROBE_SCAN = 1_024
 MIN_PROBE_FRACTION = 8.0 / 14.0  # cobre integralmente o pickbox dentro do snap
+TINY_PICK_FRACTION = 2.0 / 8.0  # entidade <2 px: bbox e indistinguivel da forma
 
 
 def entity_distance(entity, p: Vec2, sagitta: float = 0.01) -> float:
@@ -151,7 +153,20 @@ def pick_at(doc, p: Vec2, tol: float, exclude=(), probe: PointerProbe | None = N
             break  # dai em diante nenhuma pode ganhar
         if not e.is_alive or e in excluded or not _visible(doc, e):
             continue
-        d = entity_distance(e, p, sagitta)
+        box = doc.index._boxes.get(e.dxf.get("handle"))
+        proxy_too_large = (
+            e.dxftype() == "ACAD_PROXY_ENTITY"
+            and len(e.proxy_graphic or b"") > MAX_INTERACTIVE_PROXY_BYTES
+        )
+        if box is not None and (
+            proxy_too_large or max(box.width, box.height) < tol * TINY_PICK_FRACTION
+        ):
+            # Desmontar um bloco/proxy Civil 3D pode custar centenas de ms no
+            # primeiro hover. Proxies grandes usam a bbox; entidades comuns so
+            # fazem isso quando a caixa ocupa menos de dois pixels.
+            d = floor
+        else:
+            d = entity_distance(e, p, sagitta)
         if d <= tol and d < best_d:
             best, best_d = e, d
     return best

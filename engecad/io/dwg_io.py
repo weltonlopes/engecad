@@ -1,182 +1,97 @@
-"""Abrir/exportar DWG via ODA File Converter (conversao 100% local, sem rede).
+"""Adaptação do leitor DWG nativo para o modelo editável do EngeCAD.
 
-Por que isso existe
---------------------
-DWG e formato proprietario da Autodesk. O EngeCAD nao le/escreve DWG sozinho
--- ninguem faz isso sem licenciar codigo da Autodesk ou da Open Design
-Alliance. A saida pratica e gratuita e o ODA File Converter: um executavel
-distribuido de graca pela ODA que converte DWG<->DXF localmente, sem precisar
-de conta nem internet depois de instalado.
-
-O `ezdxf` (ja usado pelo resto do io/) traz um addon que chama esse
-executavel via subprocess (`ezdxf.addons.odafc`) -- e o mesmo padrao de
-raster_import.py: a ferramenta externa roda em processo separado, nunca
-importada, e cada import/export DWG passa por um DXF temporario.
-
-Fluxo:
-  - Abrir .dwg: converte para DXF temporario (odafc.readfile) e monta um
-    Document igual a um DXF de terceiro sem sidecar (mantem o CRS corrente
-    e avisa) -- exatamente a politica de dxf_io.open_document.
-  - Exportar .dwg: serializa o Document corrente para DXF temporario e
-    converte para DWG (odafc.export_dwg). Nao mexe no caminho/estado do
-    documento nativo (.dxf) -- e so uma via de saida para interoperar com
-    AutoCAD e afins.
+O parser binário está em ``engecad.dwg`` e não depende de ezdxf para ler o
+arquivo. ezdxf é usado apenas como o modelo geométrico interno já adotado
+pelas ferramentas de edição e renderização do aplicativo.
 """
 
 from __future__ import annotations
 
-import os
+import math
 from pathlib import Path
 
-import ezdxf
-from ezdxf.addons import odafc
-
-from .project import load_sidecar
-
-INSTALL_HINT = (
-    "Importar/exportar DWG exige o ODA File Converter instalado (gratuito):\n\n"
-    "  1. Baixe em https://www.opendesign.com/guestfiles/oda_file_converter\n"
-    "  2. Instale normalmente (fica em C:\\Program Files\\ODA File Converter <versao>)\n"
-    "  3. Reabra o EngeCAD (ele procura o executavel automaticamente)\n\n"
-    "Alternativa: aponte a variavel de ambiente ENGECAD_ODA_BIN direto para\n"
-    "o ODAFileConverter.exe."
-)
+from ..core.document import Document
+from ..dwg import DwgError, read
+from ..dwg.entities import iter_entities as decode_entities
 
 
-class DwgError(Exception):
-    pass
+def load_document(path: str | Path) -> Document:
+    """Lê e materializa um DWG sem tocar na interface.
 
-
-# ---------------- deteccao ----------------
-
-
-def find_oda_converter() -> Path | None:
-    """Caminho do ODAFileConverter, se instalado nesta maquina."""
-    env = os.environ.get("ENGECAD_ODA_BIN")
-    if env:
-        p = Path(env)
-        if p.is_file():
-            return p
-
-    if os.name == "nt":
-        for base in (Path(r"C:\Program Files"), Path(r"C:\Program Files (x86)")):
-            if not base.exists():
-                continue
-            try:
-                candidates = sorted(
-                    base.glob("ODA File Converter*/ODAFileConverter.exe"), reverse=True
-                )
-            except OSError:
-                candidates = []
-            if candidates:
-                return candidates[0]
-        return None
-
-    from shutil import which
-
-    path = which("ODAFileConverter")
-    return Path(path) if path else None
-
-
-def is_available() -> bool:
-    return find_oda_converter() is not None
-
-
-def _configure_odafc() -> Path:
-    """Aponta o addon do ezdxf para o executavel encontrado, ou explica como instalar."""
-    exe = find_oda_converter()
-    if exe is None:
-        raise DwgError(INSTALL_HINT)
-    key = "win_exec_path" if os.name == "nt" else "unix_exec_path"
-    ezdxf.options.set("odafc-addon", key, str(exe))
-    return exe
-
-
-# ---------------- abrir ----------------
-
-
-def open_document(ctx, path: str | Path):
-    """Converte um .dwg para DXF (em memoria) e o instala como documento corrente.
-
-    Mesma politica de dxf_io.open_document para um DXF de terceiro: sem
-    sidecar .emap.json, mantem o CRS atual do projeto e avisa o usuario.
+    A função é deliberadamente independente de ``AppContext``. Isso permite
+    que a leitura pesada rode em uma thread de trabalho e que a instalação no
+    documento visível aconteça somente na thread Qt principal.
     """
-    from ..core.document import Document
-
     p = Path(path)
-    if not p.exists():
-        raise DwgError(f"Arquivo nao encontrado: {p}")
-
-    _configure_odafc()
     try:
-        drawing = odafc.readfile(p)
-    except odafc.ODAFCNotInstalledError as exc:
-        raise DwgError(INSTALL_HINT) from exc
-    except odafc.ODAFCError as exc:
-        raise DwgError(f"Nao foi possivel converter {p.name}: {exc}") from exc
-    except ezdxf.DXFStructureError as exc:
-        raise DwgError(f"{p.name} nao e um DWG valido: {exc}") from exc
+        native = read(p)
+    except (OSError, DwgError) as exc:
+        raise DwgError(f"{p.name} não é um DWG válido ou suportado: {exc}") from exc
 
-    doc = Document(drawing, path=p)
+    doc = Document.new()
+    doc.path = p
+    decoded = 0
+    assert native.object_index is not None
+    # ENTMode=2 is the Model Space stream.  ENTMode=0 also contains valid
+    # geometry, but it belongs to block definitions (and ENTMode=1 to paper
+    # space); importing those records into Model Space both duplicates INSERT
+    # contents and can make Zoom Extents span unrelated coordinate systems.
+    model_entities = list(decode_entities(native.object_index, {2}))
+    if not model_entities:
+        # A few legacy/proprietary writers omit the mode bit.  Keep the useful
+        # fallback rather than reporting an empty drawing, while still
+        # excluding records explicitly marked as paper space.
+        model_entities = list(decode_entities(native.object_index, {0, 2}))
 
-    for layer in ctx.rasters:
-        layer.close()
-    ctx.rasters.clear()
+    for entity in model_entities:
+        layer = "0"
+        data = entity.data
+        if entity.type == "LINE":
+            doc.msp.add_line(data["start"], data["end"], dxfattribs={"layer": layer})
+        elif entity.type == "CIRCLE":
+            doc.msp.add_circle(
+                data["center"], data["radius"], dxfattribs={"layer": layer}
+            )
+        elif entity.type == "ARC":
+            doc.msp.add_arc(
+                data["center"],
+                data["radius"],
+                math.degrees(data["start_angle"]),
+                math.degrees(data["end_angle"]),
+                dxfattribs={"layer": layer},
+            )
+        elif entity.type == "POINT":
+            doc.msp.add_point(data["point"], dxfattribs={"layer": layer})
+        elif entity.type == "LWPOLYLINE":
+            vertices = data["vertices"]
+            if vertices:
+                doc.msp.add_lwpolyline(
+                    vertices,
+                    close=bool(data["flags"] & 1),
+                    dxfattribs={"layer": layer},
+                )
+        else:
+            continue
+        decoded += 1
 
-    ctx.set_document(doc)
-    data = load_sidecar(ctx, p)
-    if data is None:
-        ctx.message(
-            f"{p.name} aberto sem sidecar .emap.json - o CRS ficou como "
-            f"{doc.crs.srid}. Confira em Projeto > Sistema de coordenadas."
-        )
-    for layer in ctx.rasters:
-        layer.set_project_crs(doc.crs)
-
+    doc.rebuild_index()
     doc.mark_saved()
-    if data is None or "view" not in (data or {}):
-        ctx.zoom_extents()
-    else:
-        ctx.view_changed()
+    if decoded:
+        return doc
+    raise DwgError(f"{p.name} não contém entidades geométricas suportadas")
+
+
+def install_document(ctx, doc: Document) -> Document:
+    """Troca o documento visível; deve ser chamado na thread da interface."""
+    for raster in ctx.rasters:
+        raster.close()
+    ctx.rasters.clear()
+    ctx.set_document(doc)
+    for raster in ctx.rasters:
+        raster.set_project_crs(doc.crs)
+    ctx.zoom_extents()
     return doc
 
 
-# ---------------- exportar ----------------
-
-
-def export_document(ctx, path: str | Path, version: str | None = None) -> Path:
-    """Exporta o documento corrente como .dwg, sem alterar o .dxf nativo.
-
-    version: versao de saida do DWG (ex.: "R2018", "ACAD2013"). Default:
-    mesma versao do DXF do documento.
-    """
-    _configure_odafc()
-    target = Path(path)
-    if target.suffix.lower() != ".dwg":
-        target = target.with_suffix(".dwg")
-
-    try:
-        odafc.export_dwg(ctx.doc.drawing, target, version=version, replace=True)
-    except odafc.ODAFCNotInstalledError as exc:
-        raise DwgError(INSTALL_HINT) from exc
-    except odafc.ODAFCError as exc:
-        raise DwgError(f"Falha ao exportar {target.name}: {exc}") from exc
-    except OSError as exc:
-        raise DwgError(f"Falha ao exportar {target.name}: {exc}") from exc
-    return target
-
-
-# ---------------- diagnostico ----------------
-
-
-def diagnose() -> str:
-    """Texto de diagnostico para o menu Ajuda -- responde 'por que DWG nao abre'."""
-    exe = find_oda_converter()
-    lines = ["Suporte a DWG no EngeCAD", "=" * 34, ""]
-    if exe is None:
-        lines.append("ODA File Converter: NAO encontrado")
-        lines.append("")
-        lines.append(INSTALL_HINT)
-    else:
-        lines.append(f"ODA File Converter: encontrado em\n  {exe}")
-    return "\n".join(lines)
+def open_document(ctx, path: str | Path) -> Document:
+    return install_document(ctx, load_document(path))

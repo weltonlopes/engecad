@@ -7,13 +7,21 @@ espacial -- nunca varremos o desenho inteiro a cada movimento do mouse.
 
 from __future__ import annotations
 
+import heapq
 import itertools
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
 
-from ..core.entities import closest_on_segments, entity_segments, entity_snap_points
+from ..core.entities import (
+    MAX_INTERACTIVE_PROXY_BYTES,
+    _is_plan,
+    closest_on_segments,
+    entity_segments,
+    entity_snap_points,
+)
 from ..core.geometry import Vec2, line_intersection
 from ..core.picking import PointerProbe, probe_at
 
@@ -53,9 +61,12 @@ DEFAULT_ENABLED = {"end", "mid", "center", "quad", "node", "intersection", "near
 MAX_CANDIDATES = 64
 MAX_FOR_GEOMETRY = 16
 MAX_CROSS_SEGMENTS = 60  # pares de segmentos para intersecao crescem ao quadrado
-MAX_SNAP_POINTS = 160_000  # trabalho vetorizado maximo por movimento
+MAX_SNAP_POINTS = 24_000  # trabalho vetorizado maximo por movimento
 MAX_GEOMETRY_POINTS = 24_000
 MAX_CACHED_SNAP_POINTS = 800_000
+TINY_SNAP_FRACTION = 2.0 / 14.0
+PREWARM_MIN_VERTICES = 1_024
+PREWARM_MAX_ENTITIES = 32
 
 _POINT_KINDS = ("end", "mid", "center", "quad", "node")
 _KIND_CODE = {kind: i for i, kind in enumerate(_POINT_KINDS)}
@@ -93,11 +104,66 @@ class SnapEngine:
         self._points: OrderedDict[str, _SnapCloud] = OrderedDict()
         self._point_count = 0
         self._points_revision = -1
+        self._warm_revision = -1
+        self._warm_source = None
+        self._warm_candidates: list[tuple[int, int, object]] = []
+        self._warm_ready: list[object] | None = None
+        self._warm_order = 0
 
     def toggle(self, kind: str, on: bool | None = None) -> None:
         if on is None:
             on = kind not in self.enabled
         self.enabled.add(kind) if on else self.enabled.discard(kind)
+
+    def start_prewarm(self) -> None:
+        """Agenda as polilinhas mais pesadas para o cache fora do hover."""
+        self._warm_revision = self.doc.geometry_revision
+        self._warm_source = iter(self.doc.entities())
+        self._warm_candidates = []
+        self._warm_ready = None
+        self._warm_order = 0
+
+    def prewarm_step(self, budget_ms: float = 4.0) -> bool:
+        """Prepara snap em fatias; retorna True quando nao ha mais trabalho."""
+        if self._warm_revision != self.doc.geometry_revision:
+            self.start_prewarm()
+        if self._warm_source is None and self._warm_ready is None:
+            return True
+        deadline = time.perf_counter() + max(0.0, budget_ms) / 1000.0
+
+        while self._warm_source is not None and time.perf_counter() < deadline:
+            try:
+                entity = next(self._warm_source)
+            except StopIteration:
+                self._warm_source = None
+                self._warm_ready = [
+                    item[2] for item in sorted(self._warm_candidates, reverse=True)
+                ]
+                break
+            if entity.dxftype() != "LWPOLYLINE" or not _is_plan(entity):
+                continue
+            count = len(entity)
+            if count < PREWARM_MIN_VERTICES:
+                continue
+            item = (count, self._warm_order, entity)
+            self._warm_order += 1
+            if len(self._warm_candidates) < PREWARM_MAX_ENTITIES:
+                heapq.heappush(self._warm_candidates, item)
+            elif count > self._warm_candidates[0][0]:
+                heapq.heapreplace(self._warm_candidates, item)
+
+        # Uma nuvem individual pode ultrapassar a fatia, mas isso acontece no
+        # carregamento ocioso, nunca no primeiro movimento sobre a entidade.
+        while self._warm_ready and time.perf_counter() < deadline:
+            entity = self._warm_ready.pop(0)
+            self._snap_cloud(entity)
+            if self._point_count >= MAX_CACHED_SNAP_POINTS:
+                self._warm_ready.clear()
+                break
+        if self._warm_source is None and not self._warm_ready:
+            self._warm_ready = None
+            return True
+        return False
 
     def _snap_cloud(self, entity) -> _SnapCloud:
         """Pontos notaveis em arrays compactos, com LRU por quantidade de pontos."""
@@ -112,7 +178,10 @@ class SnapEngine:
             return self._cloud_of(points)
         hit = self._points.get(handle)
         if hit is None:
-            hit = self._cloud_of(entity_snap_points(entity))
+            if entity.dxftype() == "LWPOLYLINE" and _is_plan(entity):
+                hit = self._lwpolyline_cloud(entity)
+            else:
+                hit = self._cloud_of(entity_snap_points(entity))
             self._points[handle] = hit
             self._point_count += hit.size
             while self._point_count > MAX_CACHED_SNAP_POINTS and len(self._points) > 1:
@@ -121,6 +190,52 @@ class SnapEngine:
         else:
             self._points.move_to_end(handle)
         return hit
+
+    @staticmethod
+    def _lwpolyline_cloud(entity) -> _SnapCloud:
+        """Vertices/meios da LWPOLYLINE calculados de forma vetorizada."""
+        # ezdxf ja armazena os vertices em uma matriz NumPy Nx5. Consumir essa
+        # matriz diretamente evita uma compreensao Python de centenas de
+        # milhares de tuplas no primeiro hover sobre uma curva de nivel.
+        raw = np.asarray(entity.lwpoints.values, dtype=np.float64)
+        if raw.size == 0:
+            return SnapEngine._cloud_of([])
+        count = len(raw)
+        segment_count = count if entity.closed and count > 1 else max(0, count - 1)
+        xs = np.empty(count + segment_count, dtype=np.float64)
+        ys = np.empty_like(xs)
+        codes = np.empty(len(xs), dtype=np.uint8)
+        xs[:count], ys[:count] = raw[:, 0], raw[:, 1]
+        codes[:count] = _KIND_CODE["end"]
+        if segment_count == 0:
+            return _SnapCloud(codes, xs, ys)
+
+        start = raw[:segment_count]
+        end = np.vstack((raw[1:], raw[:1])) if segment_count == count else raw[1:]
+        x0, y0, bulge = start[:, 0], start[:, 1], start[:, 4]
+        x1, y1 = end[:, 0], end[:, 1]
+        midx, midy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+        curved = np.abs(bulge) > 1e-15
+        if curved.any():
+            dx, dy = x1[curved] - x0[curved], y1[curved] - y0[curved]
+            chord = np.hypot(dx, dy)
+            valid = chord > 1e-15
+            b = bulge[curved]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                offset = chord * (1.0 - b * b) / (4.0 * b)
+                cx = midx[curved] - dy / chord * offset
+                cy = midy[curved] + dx / chord * offset
+                theta = 4.0 * np.arctan(b)
+                angle = np.arctan2(y0[curved] - cy, x0[curved] - cx) + theta * 0.5
+                radius = chord * (1.0 + b * b) / (4.0 * np.abs(b))
+                arcx = cx + radius * np.cos(angle)
+                arcy = cy + radius * np.sin(angle)
+            indices = np.flatnonzero(curved)
+            midx[indices[valid]] = arcx[valid]
+            midy[indices[valid]] = arcy[valid]
+        xs[count:], ys[count:] = midx, midy
+        codes[count:] = _KIND_CODE["mid"]
+        return _SnapCloud(codes, xs, ys)
 
     @staticmethod
     def _cloud_of(points: list[tuple[str, Vec2]]) -> _SnapCloud:
@@ -184,6 +299,40 @@ class SnapEngine:
             # nada dele pode ganhar, nem em prioridade nem em distancia.
             if best is not None and best[0] == top and floor > best[1]:
                 break
+            box = self.doc.index._boxes.get(e.dxf.get("handle"))
+            if (
+                box is not None
+                and e.dxftype() == "ACAD_PROXY_ENTITY"
+                and len(e.proxy_graphic or b"") > MAX_INTERACTIVE_PROXY_BYTES
+            ):
+                corners = (
+                    Vec2(box.minx, box.miny),
+                    Vec2(box.maxx, box.miny),
+                    Vec2(box.maxx, box.maxy),
+                    Vec2(box.minx, box.maxy),
+                )
+                for corner in corners:
+                    consider("end", corner, e)
+                # Aproxima a geometria pela borda da caixa, nunca pelo interior:
+                # o cursor no meio de uma proxy esparsa nao deve grudar nela.
+                edge = min(
+                    (
+                        Vec2(box.minx, min(max(world.y, box.miny), box.maxy)),
+                        Vec2(box.maxx, min(max(world.y, box.miny), box.maxy)),
+                        Vec2(min(max(world.x, box.minx), box.maxx), box.miny),
+                        Vec2(min(max(world.x, box.minx), box.maxx), box.maxy),
+                    ),
+                    key=world.distance_to,
+                )
+                consider("nearest", edge, e)
+                continue
+            if box is not None and max(box.width, box.height) < radius * TINY_SNAP_FRACTION:
+                # Em zoom aberto, decompor milhares de vertices de um simbolo
+                # que ocupa menos de dois pixels causa um pico perceptivel no
+                # primeiro hover sem melhorar o ponto mostrado. O centro da
+                # bbox e a representacao coerente com o LOD do renderer.
+                consider("node", box.center, e)
+                continue
             cloud = self._snap_cloud(e)
             if cloud.size:
                 # Distancias de dezenas de milhares de vertices saem em C/NumPy,
