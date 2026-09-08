@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..context import AppContext
+from ..io.dwg_io import install_document, load_document
 from ..io.dxf_io import DxfError, new_document, open_document, save_document
 from ..io.raster_import import (
     RasterImportError,
@@ -44,7 +45,8 @@ RASTER_FILTER = (
     "Imagens georreferenciadas (*.ecw *.tif *.tiff *.jp2 *.img *.sid *.vrt *.png *.jpg);;"
     "ECW (*.ecw);;GeoTIFF/COG (*.tif *.tiff);;Todos (*)"
 )
-DXF_FILTER = "Desenho DXF (*.dxf);;Todos (*)"
+CAD_FILTER = "Desenhos CAD (*.dxf *.dwg);;DXF (*.dxf);;DWG (*.dwg);;Todos (*)"
+DXF_SAVE_FILTER = "Desenho DXF (*.dxf);;Todos (*)"
 SHAPEFILE_FILTER = "Shapefile (*.shp);;Todos (*)"
 
 
@@ -66,10 +68,29 @@ class _ConvertWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class _DwgWorker(QThread):
+    """Lê o DWG fora da thread Qt sem tocar em widgets ou no contexto."""
+
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+
+    def run(self):
+        try:
+            self.loaded.emit(load_document(self.path))
+        except Exception as exc:  # o slot principal mostra a falha ao usuário
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ctx = AppContext()
+        self._dwg_worker: _DwgWorker | None = None
+        self._dwg_progress: QProgressDialog | None = None
         self.setWindowTitle("EngeCAD")
         self.resize(1400, 880)
 
@@ -167,7 +188,7 @@ class MainWindow(QMainWindow):
     def _build_actions(self) -> None:
         m_file = self.menuBar().addMenu("&Arquivo")
         m_file.addAction(self._act("&Novo...", self.on_new, "Ctrl+N"))
-        m_file.addAction(self._act("&Abrir DXF...", self.on_open, "Ctrl+O"))
+        m_file.addAction(self._act("&Abrir desenho CAD...", self.on_open, "Ctrl+O"))
         m_file.addAction(self._act("&Salvar", self.on_save, "Ctrl+S"))
         m_file.addAction(self._act("Salvar &como...", self.on_save_as, "Ctrl+Shift+S"))
         m_file.addSeparator()
@@ -555,7 +576,7 @@ class MainWindow(QMainWindow):
     def _ribbon_window_actions(self) -> dict[str, QAction]:
         specs = {
             "NEW": ("Novo", self.on_new, "Criar um novo desenho"),
-            "OPEN": ("Abrir", self.on_open, "Abrir desenho DXF"),
+            "OPEN": ("Abrir", self.on_open, "Abrir desenho CAD"),
             "SAVE": ("Salvar", self.on_save, "Salvar o desenho atual"),
             "SAVE_AS": ("Salvar como", self.on_save_as, "Salvar em outro arquivo"),
             "IMPORT_RASTER": ("Imagem", self.on_import_raster, "Importar imagem georreferenciada"),
@@ -814,8 +835,11 @@ class MainWindow(QMainWindow):
     def on_open(self) -> None:
         if not self._confirm_discard():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Abrir DXF", "", DXF_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir desenho CAD", "", CAD_FILTER)
         if not path:
+            return
+        if Path(path).suffix.lower() == ".dwg":
+            self._open_dwg_async(path)
             return
         try:
             open_document(self.ctx, path)
@@ -823,6 +847,47 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erro ao abrir", str(exc))
             return
         self.ctx.message(f"Aberto: {Path(path).name}")
+
+    def _open_dwg_async(self, path: str) -> None:
+        if self._dwg_worker is not None and self._dwg_worker.isRunning():
+            self.ctx.message("Já existe uma leitura DWG em andamento")
+            return
+
+        progress = QProgressDialog("Lendo DWG nativo...", "", 0, 0, self)
+        progress.setWindowTitle("Abrir DWG")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setCancelButton(None)
+        progress.show()
+        self._dwg_progress = progress
+
+        worker = _DwgWorker(path, self)
+        self._dwg_worker = worker
+        worker.loaded.connect(self._on_dwg_loaded)
+        worker.failed.connect(self._on_dwg_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_dwg_finished)
+        worker.start()
+
+    def _on_dwg_loaded(self, doc) -> None:
+        try:
+            install_document(self.ctx, doc)
+            self.ctx.message(f"Aberto: {doc.path.name} (leitura DWG nativa)")
+        except Exception as exc:
+            self._on_dwg_failed(str(exc))
+
+    def _on_dwg_failed(self, message: str) -> None:
+        if self._dwg_progress is not None:
+            self._dwg_progress.close()
+        QMessageBox.critical(self, "Erro ao abrir DWG", message)
+
+    def _on_dwg_finished(self) -> None:
+        if self._dwg_progress is not None:
+            self._dwg_progress.close()
+            self._dwg_progress.deleteLater()
+            self._dwg_progress = None
+        self._dwg_worker = None
 
     def on_save(self) -> bool:
         if self.ctx.doc.path is None:
@@ -837,7 +902,7 @@ class MainWindow(QMainWindow):
         return True
 
     def on_save_as(self) -> bool:
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar DXF", "", DXF_FILTER)
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar DXF", "", DXF_SAVE_FILTER)
         if not path:
             return False
         try:
@@ -994,7 +1059,8 @@ class MainWindow(QMainWindow):
             f"<h3>EngeCAD {__version__}</h3>"
             "<p>CAD livre para mapeamento e plantas cadastrais.</p>"
             "<p>Construido sobre PySide6, ezdxf, pyproj e rasterio.</p>"
-            "<p>Formato nativo: DXF. Coordenadas em float64 no CRS do projeto.</p>",
+            "<p>Formato de trabalho: DXF; leitura nativa DWG. "
+            "Coordenadas em float64 no CRS do projeto.</p>",
         )
 
     # ---------------- fechamento ----------------
@@ -1005,4 +1071,7 @@ class MainWindow(QMainWindow):
             return
         for layer in self.ctx.rasters:
             layer.close()
+        if self._dwg_worker is not None and self._dwg_worker.isRunning():
+            self._dwg_worker.requestInterruption()
+            self._dwg_worker.wait(2_000)
         ev.accept()

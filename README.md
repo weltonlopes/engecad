@@ -4,7 +4,10 @@ CAD livre para **mapeamento e plantas cadastrais**: desenhe sobre ortofoto
 georreferenciada, com sistema de coordenadas de verdade, precisão topográfica na
 entrada por teclado e automação em Python.
 
-Formato nativo **DXF** — o arquivo abre no AutoCAD e no QGIS sem exportar nada.
+Formato de trabalho **DXF** e leitura nativa de **DWG AC1018/AC1021/AC1024/AC1027/AC1032**.
+O leitor DWG é implementado no próprio projeto, seguindo o contêiner binário,
+compressão, mapas de páginas, índices de handles e fluxos de entidades da
+especificação ODA; a edição aberta é materializada no modelo geométrico interno.
 
 ```
 Versão 0.2.0 · licença GPL-3.0 · Python 3.10–3.13
@@ -28,6 +31,7 @@ Rodar:
 ```bash
 python -m engecad
 python -m engecad planta.dxf     # abre um desenho direto
+python -m engecad planta.dwg     # abre um DWG diretamente
 ```
 
 ---
@@ -52,7 +56,7 @@ python -m engecad planta.dxf     # abre um desenho direto
 | **Snap** | extremidade, ponto médio, centro, quadrante, interseção, próximo, grade |
 | **Camadas** | visibilidade, cor ACI, camada corrente |
 | **Medição** | `DIST` (distância + azimute em GMS), `AREA` (área + perímetro + hectares) |
-| **Arquivo** | abrir/salvar DXF R2018 + sidecar `.emap.json` |
+| **Arquivo** | abrir/salvar DXF R2018 + abrir DWG nativo + sidecar `.emap.json` |
 | **Importar** | shapefile (`.shp`, com reprojeção via `.prj` e separação em camadas por atributo) |
 | **Automação** | console Python embutido (F9) e execução de arquivos `.py` |
 
@@ -234,8 +238,9 @@ engecad/
   core/        geometria, documento, CRS, undo, snapshot, seleção, picking,
                grips, offset, aparar, índice espacial, registro     (SEM Qt)
   render/      viewport, canvas, camada raster, tema
-  io/          DXF, sidecar .emap.json, importação de raster (cadeia ECW)
-               e de shapefile
+  io/          DXF, DWG nativo, sidecar .emap.json, importação de raster
+               (cadeia ECW) e de shapefile
+  dwg/         contêiner AC18/R2007+, bitstream, índice de objetos e entidades
   tools/       ferramentas interativas (máquinas de estado)
   snap/        motor de osnap
   ui/          janela, linha de comando, painel de camadas, diálogo de CRS

@@ -18,6 +18,14 @@ class DxfError(Exception):
 def open_document(ctx, path: str | Path) -> Document:
     """Abre o DXF, aplica o sidecar e instala no contexto."""
     p = Path(path)
+    if p.suffix.lower() == ".dwg":
+        from .dwg_io import open_document as open_dwg_document
+        from ..dwg import DwgError
+
+        try:
+            return open_dwg_document(ctx, p)
+        except DwgError as exc:
+            raise DxfError(f"Falha ao abrir {p.name}: {exc}") from exc
     try:
         doc = Document.open(p)
     except OSError as exc:
